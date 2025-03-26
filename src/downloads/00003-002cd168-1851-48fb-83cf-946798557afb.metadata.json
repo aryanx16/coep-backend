@@ -1,0 +1,223 @@
+{
+  "format-version" : 2,
+  "table-uuid" : "df8e4577-a782-4070-93f2-f8454b13f735",
+  "location" : "s3://coep-inspiron-iceberg-demo/nyc_taxi_iceberg",
+  "last-sequence-number" : 3,
+  "last-updated-ms" : 1742992594678,
+  "last-column-id" : 19,
+  "current-schema-id" : 0,
+  "schemas" : [ {
+    "type" : "struct",
+    "schema-id" : 0,
+    "fields" : [ {
+      "id" : 1,
+      "name" : "vendorid",
+      "required" : false,
+      "type" : "long"
+    }, {
+      "id" : 2,
+      "name" : "tpep_pickup_datetime",
+      "required" : false,
+      "type" : "timestamp"
+    }, {
+      "id" : 3,
+      "name" : "tpep_dropoff_datetime",
+      "required" : false,
+      "type" : "timestamp"
+    }, {
+      "id" : 4,
+      "name" : "passenger_count",
+      "required" : false,
+      "type" : "double"
+    }, {
+      "id" : 5,
+      "name" : "trip_distance",
+      "required" : false,
+      "type" : "double"
+    }, {
+      "id" : 6,
+      "name" : "ratecodeid",
+      "required" : false,
+      "type" : "double"
+    }, {
+      "id" : 7,
+      "name" : "store_and_fwd_flag",
+      "required" : false,
+      "type" : "string"
+    }, {
+      "id" : 8,
+      "name" : "pulocationid",
+      "required" : false,
+      "type" : "long"
+    }, {
+      "id" : 9,
+      "name" : "dolocationid",
+      "required" : false,
+      "type" : "long"
+    }, {
+      "id" : 10,
+      "name" : "payment_type",
+      "required" : false,
+      "type" : "long"
+    }, {
+      "id" : 11,
+      "name" : "fare_amount",
+      "required" : false,
+      "type" : "double"
+    }, {
+      "id" : 12,
+      "name" : "extra",
+      "required" : false,
+      "type" : "double"
+    }, {
+      "id" : 13,
+      "name" : "mta_tax",
+      "required" : false,
+      "type" : "double"
+    }, {
+      "id" : 14,
+      "name" : "tip_amount",
+      "required" : false,
+      "type" : "double"
+    }, {
+      "id" : 15,
+      "name" : "tolls_amount",
+      "required" : false,
+      "type" : "double"
+    }, {
+      "id" : 16,
+      "name" : "improvement_surcharge",
+      "required" : false,
+      "type" : "double"
+    }, {
+      "id" : 17,
+      "name" : "total_amount",
+      "required" : false,
+      "type" : "double"
+    }, {
+      "id" : 18,
+      "name" : "congestion_surcharge",
+      "required" : false,
+      "type" : "double"
+    }, {
+      "id" : 19,
+      "name" : "airport_fee",
+      "required" : false,
+      "type" : "double"
+    } ]
+  } ],
+  "default-spec-id" : 0,
+  "partition-specs" : [ {
+    "spec-id" : 0,
+    "fields" : [ {
+      "name" : "tpep_pickup_datetime_day",
+      "transform" : "day",
+      "source-id" : 2,
+      "field-id" : 1000
+    } ]
+  } ],
+  "last-partition-id" : 1000,
+  "default-sort-order-id" : 0,
+  "sort-orders" : [ {
+    "order-id" : 0,
+    "fields" : [ ]
+  } ],
+  "properties" : {
+    "write.object-storage.enabled" : "true",
+    "write.object-storage.path" : "s3://coep-inspiron-iceberg-demo/nyc_taxi_iceberg/data",
+    "write.parquet.compression-codec" : "zstd"
+  },
+  "current-snapshot-id" : 2519096964624795654,
+  "refs" : {
+    "main" : {
+      "snapshot-id" : 2519096964624795654,
+      "type" : "branch"
+    }
+  },
+  "snapshots" : [ {
+    "sequence-number" : 1,
+    "snapshot-id" : 6986337821805190246,
+    "timestamp-ms" : 1742928387660,
+    "summary" : {
+      "operation" : "append",
+      "trino_query_id" : "20250325_184621_00124_7448y",
+      "added-data-files" : "32",
+      "added-records" : "164263",
+      "added-files-size" : "2971666",
+      "changed-partition-count" : "32",
+      "total-records" : "164263",
+      "total-files-size" : "2971666",
+      "total-data-files" : "32",
+      "total-delete-files" : "0",
+      "total-position-deletes" : "0",
+      "total-equality-deletes" : "0"
+    },
+    "manifest-list" : "s3://coep-inspiron-iceberg-demo/nyc_taxi_iceberg/metadata/snap-6986337821805190246-1-f0c3680a-1613-4b72-bbd9-c07705740461.avro",
+    "schema-id" : 0
+  }, {
+    "sequence-number" : 2,
+    "snapshot-id" : 6204561655040708693,
+    "parent-snapshot-id" : 6986337821805190246,
+    "timestamp-ms" : 1742991472210,
+    "summary" : {
+      "operation" : "overwrite",
+      "trino_query_id" : "20250326_121746_00039_5iihx",
+      "added-position-delete-files" : "31",
+      "added-delete-files" : "31",
+      "added-files-size" : "39507",
+      "added-position-deletes" : "463",
+      "changed-partition-count" : "31",
+      "total-records" : "164263",
+      "total-files-size" : "3011173",
+      "total-data-files" : "32",
+      "total-delete-files" : "31",
+      "total-position-deletes" : "463",
+      "total-equality-deletes" : "0"
+    },
+    "manifest-list" : "s3://coep-inspiron-iceberg-demo/nyc_taxi_iceberg/metadata/snap-6204561655040708693-1-5b543426-bf14-4102-bbc9-81bbc344c114.avro",
+    "schema-id" : 0
+  }, {
+    "sequence-number" : 3,
+    "snapshot-id" : 2519096964624795654,
+    "parent-snapshot-id" : 6204561655040708693,
+    "timestamp-ms" : 1742992594678,
+    "summary" : {
+      "operation" : "overwrite",
+      "trino_query_id" : "20250326_123630_00103_5sjc8",
+      "added-position-delete-files" : "31",
+      "added-delete-files" : "31",
+      "added-files-size" : "42477",
+      "added-position-deletes" : "1936",
+      "changed-partition-count" : "31",
+      "total-records" : "164263",
+      "total-files-size" : "3053650",
+      "total-data-files" : "32",
+      "total-delete-files" : "62",
+      "total-position-deletes" : "2399",
+      "total-equality-deletes" : "0"
+    },
+    "manifest-list" : "s3://coep-inspiron-iceberg-demo/nyc_taxi_iceberg/metadata/snap-2519096964624795654-1-b97cb208-0501-4ad4-b9fd-75903e6dd87b.avro",
+    "schema-id" : 0
+  } ],
+  "statistics" : [ ],
+  "snapshot-log" : [ {
+    "timestamp-ms" : 1742928387660,
+    "snapshot-id" : 6986337821805190246
+  }, {
+    "timestamp-ms" : 1742991472210,
+    "snapshot-id" : 6204561655040708693
+  }, {
+    "timestamp-ms" : 1742992594678,
+    "snapshot-id" : 2519096964624795654
+  } ],
+  "metadata-log" : [ {
+    "timestamp-ms" : 1742927888023,
+    "metadata-file" : "s3://coep-inspiron-iceberg-demo/nyc_taxi_iceberg/metadata/00000-6a2c4221-9a36-4f9f-bbad-29e2fc1c4dc9.metadata.json"
+  }, {
+    "timestamp-ms" : 1742928387660,
+    "metadata-file" : "s3://coep-inspiron-iceberg-demo/nyc_taxi_iceberg/metadata/00001-a01803d0-0dbd-4e5f-bad1-18708d085eca.metadata.json"
+  }, {
+    "timestamp-ms" : 1742991472210,
+    "metadata-file" : "s3://coep-inspiron-iceberg-demo/nyc_taxi_iceberg/metadata/00002-5bdd37db-cb9d-4269-ab3b-908ae7c1afe5.metadata.json"
+  } ]
+}
