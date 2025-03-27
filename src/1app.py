@@ -56,22 +56,16 @@ def download_latest_file():
     except Exception as e:
         return jsonify({"error": str(e)}), 500 
 
-
 @app.route('/parse-s3', methods=['GET'])
 def parse_s3():
-    """
-    This endpoint takes an S3 URL via the 's3_url' query parameter,
-    downloads the file (expected to be a JSON metadata file), parses it,
-    and returns the extracted important data.
-    """
-    s3_url ="s3://coep-inspiron-iceberg-demo/nyc_taxi_iceberg/metadata/00003-002cd168-1851-48fb-83cf-946798557afb.metadata.json"
+    s3_url = "s3://coep-inspiron-iceberg-demo/nyc_taxi_iceberg"
     
     if not s3_url:
         return jsonify({"error": "s3_url parameter is missing"}), 400
 
     try:
-        # Extract bucket and object key from the provided S3 URL
-        bucket_name, object_key = extract_bucket_and_key(s3_url)
+        # Extract bucket and prefix (which represents the folder path)
+        bucket_name, prefix = extract_bucket_and_key(s3_url)
 
         # Create an S3 client using the provided credentials
         s3_client = boto3.client(
@@ -81,22 +75,34 @@ def parse_s3():
             region_name=aws_region
         )
 
-        # Retrieve the object from S3
-        response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
-        content = response["Body"].read().decode('utf-8')
+        # List all objects under the given prefix
+        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+        objects = response.get("Contents", [])
         
+        # Filter objects to get only those ending with "metadata.json"
+        metadata_files = [obj for obj in objects if obj["Key"].endswith("metadata.json")]
+        
+        if not metadata_files:
+            return jsonify({"error": "No metadata.json file found in the provided path"}), 404
+
+        # Sort the metadata files by LastModified date (newest first)
+        metadata_files.sort(key=lambda x: x["LastModified"], reverse=True)
+        latest_metadata = metadata_files[0]
+        latest_key = latest_metadata["Key"]
+
+        # Retrieve the latest metadata.json file from S3
+        obj_response = s3_client.get_object(Bucket=bucket_name, Key=latest_key)
+        content = obj_response["Body"].read().decode('utf-8')
+
         # Parse the JSON content
         json_data = json.loads(content)
         
-        # Optionally, filter or extract only the important fields from json_data
-        # For demonstration, we're returning the whole JSON data.
         return jsonify(json_data), 200
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+        return jsonify({"error": str(e)}), 500 
     
- 
+    
 def extract_bucket_and_key(s3_url):
     """Extract bucket name and object key from an S3 URL."""
     if not s3_url.startswith("s3://"):
