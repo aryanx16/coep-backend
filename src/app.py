@@ -632,9 +632,7 @@ def iceberg_details():
                 "approx_live_records": approx_live_records,
                 "metrics_note": "Live record count is an approximation based on manifest metadata counts for data and delete files. It may differ from query engine results. Partition record counts are gross counts from data files.",
                 "total_data_storage_bytes": total_data_storage_bytes,
-                "total_data_storage_human": format_bytes(total_data_storage_bytes), # Add human readable
                 "total_delete_storage_bytes": total_delete_storage_bytes,
-                "total_delete_storage_human": format_bytes(total_delete_storage_bytes), # Add human readable
                 "avg_live_records_per_data_file": round(avg_live_records_per_data_file, 2),
                 "avg_data_file_size_mb": round(avg_data_file_size_mb, 4),
             },
@@ -675,7 +673,7 @@ def delta_details():
             print(f"DEBUG: Using temporary directory: {temp_dir}")
 
             # --- 1. Find Delta Log Files ---
-            log_files_raw = [] # Store raw S3 object info (including Size)
+            log_files_raw = []
             continuation_token = None
             print(f"DEBUG: Listing objects under {delta_log_prefix}")
             while True:
@@ -683,18 +681,16 @@ def delta_details():
                 if continuation_token: list_kwargs['ContinuationToken'] = continuation_token
                 try:
                     list_response = s3_client.list_objects_v2(**list_kwargs)
-                except s3_client.exceptions.NoSuchKey: # Handle case where prefix itself doesn't exist cleanly
-                     list_response = {} # Treat as empty response
+                except s3_client.exceptions.NoSuchKey: list_response = {}
                 except s3_client.exceptions.ClientError as list_err:
-                     # Handle other potential errors during listing
                      print(f"ERROR: ClientError listing objects under {delta_log_prefix}: {list_err}")
                      return jsonify({"error": f"Error listing Delta log files: {list_err}"}), 500
 
-                if 'Contents' not in list_response and not log_files_raw: # Check if truly empty on first fetch
+                if 'Contents' not in list_response and not log_files_raw:
                     try:
-                        # Check if base table path exists at all
-                        s3_client.head_object(Bucket=bucket_name, Key=table_base_key.rstrip('/')) # Check base dir marker or common file? Check only prefix existence is safer.
-                        # If head_object succeeds on base path, but log is empty:
+                        # Check if base prefix exists (list_objects_v2 with delimiter might be better)
+                        s3_client.list_objects_v2(Bucket=bucket_name, Prefix=table_base_key, Delimiter='/', MaxKeys=1)
+                        # If base exists but log is empty:
                         return jsonify({"error": f"Delta log prefix '{delta_log_prefix}' found but is empty. May not be a valid Delta table or is empty."}), 404
                     except s3_client.exceptions.ClientError as head_err:
                          error_code = head_err.response.get('Error', {}).get('Code')
@@ -710,9 +706,8 @@ def delta_details():
                 else: break
             print(f"DEBUG: Found {len(log_files_raw)} total objects under delta log prefix.")
 
-            # --- NEW: List for manifest file info ---
-            delta_log_files_info = [] # Renamed from delta_manifest_files for clarity
-
+            # --- Collect Metadata File Info ---
+            delta_log_files_info = []
             json_commits = {}
             checkpoint_files = {}
             last_checkpoint_info = None
@@ -720,16 +715,16 @@ def delta_details():
             json_pattern = re.compile(r"(\d+)\.json$")
             checkpoint_pattern = re.compile(r"(\d+)\.checkpoint(?:\.(\d+)\.(\d+))?\.parquet$")
 
-            for obj in log_files_raw: # Use log_files_raw which includes 'Size'
+            for obj in log_files_raw:
                 key = obj['Key']
                 filename = os.path.basename(key)
-                size = obj.get('Size') # Get size
+                size = obj.get('Size')
 
-                # Add all relevant files to the info list
+                # Add relevant files to info list
                 if filename == "_last_checkpoint" or json_pattern.match(filename) or checkpoint_pattern.match(filename):
                      delta_log_files_info.append({
                          "file_path": f"s3://{bucket_name}/{key}",
-                         "relative_path": key.replace(table_base_key, "", 1), # Get path relative to table base
+                         "relative_path": key.replace(table_base_key, "", 1),
                          "size_bytes": size,
                          "size_human": format_bytes(size)
                      })
@@ -743,8 +738,7 @@ def delta_details():
                             last_checkpoint_info = {
                                 'version': last_checkpoint_data['version'],
                                 'parts': last_checkpoint_data.get('parts'),
-                                'key': key,
-                                'size': size # Store size
+                                'key': key, 'size': size
                             }
                             print(f"DEBUG: Found _last_checkpoint pointing to version {last_checkpoint_info['version']} (parts: {last_checkpoint_info['parts']})")
                     except Exception as cp_err:
@@ -754,7 +748,7 @@ def delta_details():
                 json_match = json_pattern.match(filename)
                 if json_match:
                     version = int(json_match.group(1))
-                    json_commits[version] = {'key': key, 'last_modified': obj['LastModified'], 'size': size} # Store size
+                    json_commits[version] = {'key': key, 'last_modified': obj['LastModified'], 'size': size}
                     continue
 
                 cp_match = checkpoint_pattern.match(filename)
@@ -763,44 +757,45 @@ def delta_details():
                     part_num = int(cp_match.group(2)) if cp_match.group(2) else 1
                     num_parts = int(cp_match.group(3)) if cp_match.group(3) else 1
                     if version not in checkpoint_files: checkpoint_files[version] = {'num_parts': num_parts, 'parts': {}}
-                    checkpoint_files[version]['parts'][part_num] = {'key': key, 'last_modified': obj['LastModified'], 'size': size} # Store size
+                    checkpoint_files[version]['parts'][part_num] = {'key': key, 'last_modified': obj['LastModified'], 'size': size}
                     if checkpoint_files[version]['num_parts'] != num_parts and cp_match.group(2):
                         print(f"Warning: Inconsistent number of parts detected for checkpoint version {version}.")
                         checkpoint_files[version]['num_parts'] = max(checkpoint_files[version]['num_parts'], num_parts)
 
-            # Sort the collected log file info (optional, e.g., by path)
             delta_log_files_info.sort(key=lambda x: x.get('relative_path', ''))
 
-            if not json_commits:
-                # Allow tables that might *only* have a checkpoint (less common, but possible)
-                if not checkpoint_files and not last_checkpoint_info:
-                     return jsonify({"error": "No Delta commit JSON files or checkpoint files found in _delta_log. Invalid Delta table."}), 404
-                elif not json_commits and (checkpoint_files or last_checkpoint_info):
-                     print("Warning: No JSON commit files found, but checkpoints exist. Proceeding with checkpoint.")
-                     # Need to determine the latest version *from the checkpoint* if no JSON files exist
-                     if last_checkpoint_info:
-                          current_snapshot_id = last_checkpoint_info['version']
-                     elif checkpoint_files:
-                          current_snapshot_id = max(checkpoint_files.keys())
-                     else: # Should not happen given the outer if condition
-                           return jsonify({"error": "Inconsistent state: Checkpoints found but cannot determine latest version."}), 500
-                     print(f"INFO: Latest Delta version derived from checkpoint: {current_snapshot_id}")
+            # Determine latest version ID
+            current_snapshot_id = -1
+            if json_commits:
+                current_snapshot_id = max(json_commits.keys())
+            elif last_checkpoint_info:
+                current_snapshot_id = last_checkpoint_info['version']
+            elif checkpoint_files:
+                # Find the highest version number among complete checkpoints
+                complete_cp_versions = [v for v, info in checkpoint_files.items() if len(info['parts']) == info['num_parts']]
+                if complete_cp_versions:
+                     current_snapshot_id = max(complete_cp_versions)
 
-            else:
-                 current_snapshot_id = max(json_commits.keys())
-                 print(f"INFO: Latest Delta version (snapshot ID): {current_snapshot_id}")
+            if current_snapshot_id == -1:
+                 # If still -1, check for incomplete checkpoints
+                 if checkpoint_files:
+                     current_snapshot_id = max(checkpoint_files.keys()) # Use latest known, even if incomplete
 
+            if current_snapshot_id == -1:
+                 return jsonify({"error": "No Delta commit JSON files or checkpoint files found. Cannot determine table version."}), 404
+
+            print(f"INFO: Latest Delta version (snapshot ID) identified: {current_snapshot_id}")
 
             # --- 2. Determine State Reconstruction Strategy ---
-            # ...(keep existing checkpoint finding logic)...
             active_files = {}
             metadata_from_log = None
             protocol_from_log = None
             start_process_version = 0
             checkpoint_version_used = None
+            all_checkpoint_actions = [] # Store checkpoint actions if loaded
             effective_checkpoint_version = -1
 
-            # Find effective checkpoint version (check last_checkpoint_info first, then latest complete)
+            # Find effective checkpoint version (logic remains the same)
             cp_version_candidate = -1
             if last_checkpoint_info:
                 cp_version_candidate = last_checkpoint_info['version']
@@ -812,37 +807,32 @@ def delta_details():
                      cp_version_candidate = available_complete_checkpoints[0]
 
             if cp_version_candidate > -1:
+                # Check if candidate is usable (exists and complete)
                 if cp_version_candidate in checkpoint_files and \
                    len(checkpoint_files[cp_version_candidate]['parts']) == checkpoint_files[cp_version_candidate]['num_parts']:
                     effective_checkpoint_version = cp_version_candidate
-                    if last_checkpoint_info and last_checkpoint_info['version'] != effective_checkpoint_version:
-                        print(f"INFO: _last_checkpoint pointed to {last_checkpoint_info['version']}, but using latest complete checkpoint {effective_checkpoint_version}.")
+                    # Optionally adjust log message based on _last_checkpoint consistency
                 else:
-                     print(f"Warning: Checkpoint version {cp_version_candidate} indicated but files are missing or incomplete. Trying to find earlier complete checkpoint.")
-                     # Fallback: Find the highest *complete* checkpoint strictly *less* than the candidate
+                     # Fallback to find latest complete checkpoint *before* candidate
                      available_complete_checkpoints = sorted([
                          v for v, info in checkpoint_files.items() if len(info['parts']) == info['num_parts'] and v < cp_version_candidate
                      ], reverse=True)
                      if available_complete_checkpoints:
                          effective_checkpoint_version = available_complete_checkpoints[0]
-                         print(f"INFO: Using latest complete checkpoint found at version {effective_checkpoint_version} instead.")
-                     else:
-                          print("Warning: No earlier complete checkpoint files found. Will process all JSON logs.")
-                          effective_checkpoint_version = -1
+                         print(f"INFO: Using latest complete checkpoint found at version {effective_checkpoint_version} (candidate {cp_version_candidate} was incomplete/missing).")
+                     else: effective_checkpoint_version = -1 # No usable earlier checkpoint
 
             # Process Checkpoint if found
             if effective_checkpoint_version > -1:
                 print(f"INFO: Reading state from checkpoint version {effective_checkpoint_version}")
                 checkpoint_version_used = effective_checkpoint_version
                 cp_info = checkpoint_files[effective_checkpoint_version]
-                all_checkpoint_actions = []
                 try:
                     for part_num in sorted(cp_info['parts'].keys()):
                         part_key = cp_info['parts'][part_num]['key']
                         all_checkpoint_actions.extend(read_delta_checkpoint(s3_client, bucket_name, part_key, temp_dir))
 
                     # Process actions from checkpoint
-                    # ...(keep existing checkpoint action processing logic)...
                     for action in all_checkpoint_actions:
                         if 'add' in action and action['add']:
                             add_info = action['add']
@@ -852,7 +842,7 @@ def delta_details():
                             if add_info.get('stats'):
                                 try: stats_parsed = json.loads(add_info['stats'])
                                 except: pass
-                            active_files[path] = { 'size': add_info['size'], 'partitionValues': add_info.get('partitionValues', {}), 'modificationTime': mod_time, 'stats': stats_parsed, 'tags': add_info.get('tags') }
+                            active_files[path] = { 'size': add_info.get('size'), 'partitionValues': add_info.get('partitionValues', {}), 'modificationTime': mod_time, 'stats': stats_parsed, 'tags': add_info.get('tags') }
                         elif 'metaData' in action and action['metaData']:
                             metadata_from_log = action['metaData']
                             print(f"DEBUG: Found metaData in checkpoint {effective_checkpoint_version}")
@@ -870,14 +860,13 @@ def delta_details():
                     protocol_from_log = None
                     start_process_version = 0
                     checkpoint_version_used = None
+                    all_checkpoint_actions = [] # Clear actions if fallback
             else:
-                print("INFO: No usable checkpoint found. Processing all JSON logs from version 0.")
+                print("INFO: No usable checkpoint found or chosen. Processing JSON logs from version 0.")
                 start_process_version = 0
 
             # --- 3. Process JSON Commits ---
-            # ...(keep existing JSON commit processing loop)...
             versions_to_process = sorted([v for v in json_commits if v >= start_process_version])
-            # Adjust condition: if only checkpoint loaded, that's okay, versions_to_process can be empty
             if not versions_to_process and checkpoint_version_used is None and not active_files:
                  return jsonify({"error": "No JSON commits found to process and no checkpoint loaded."}), 500
             elif not versions_to_process and checkpoint_version_used is not None:
@@ -886,22 +875,25 @@ def delta_details():
             print(f"INFO: Processing {len(versions_to_process)} JSON versions from {start_process_version} to {current_snapshot_id}...")
             all_commit_info = {} # Store details per commit
 
+            # Needed to track removed file sizes if not in commitInfo
+            removed_file_sizes_by_commit = {}
+
             for version in versions_to_process:
                 commit_file_info = json_commits[version]
                 commit_key = commit_file_info['key']
                 print(f"DEBUG: Processing version {version} ({commit_key})...")
+                removed_file_sizes_by_commit[version] = 0
                 try:
                     actions = read_delta_json_lines(s3_client, bucket_name, commit_key, temp_dir)
-                    # Initialize commit summary with default 0/None values
                     commit_summary_details = {
                         'version': version, 'timestamp': None, 'operation': 'Unknown',
                         'num_actions': len(actions), 'operationParameters': {},
                         'num_added_files': 0, 'num_removed_files': 0,
-                        'added_bytes': 0, 'removed_bytes': 0
-                        }
+                        'added_bytes': 0, 'removed_bytes': 0,
+                        'metrics': {} # Store raw op metrics
+                    }
+                    op_metrics = {} # Parsed metrics from commitInfo
 
-                    # Process actions within the commit
-                    # ...(keep existing action processing logic: commitInfo, add, remove, metaData, protocol)...
                     for action in actions:
                          if 'commitInfo' in action and action['commitInfo']:
                              ci = action['commitInfo']
@@ -909,13 +901,14 @@ def delta_details():
                              commit_summary_details['operation'] = ci.get('operation', 'Unknown')
                              commit_summary_details['operationParameters'] = ci.get('operationParameters', {})
                              op_metrics = ci.get('operationMetrics', {})
-                             # Ensure values are parsed as integers, default to current value if parsing fails or key missing
-                             try: commit_summary_details['num_added_files'] = int(op_metrics.get('numOutputFiles', commit_summary_details['num_added_files']))
-                             except (ValueError, TypeError): pass
-                             try: commit_summary_details['num_removed_files'] = int(op_metrics.get('numRemovedFiles', commit_summary_details['num_removed_files']))
-                             except (ValueError, TypeError): pass
-                             try: commit_summary_details['added_bytes'] = int(op_metrics.get('numOutputBytes', commit_summary_details['added_bytes']))
-                             except (ValueError, TypeError): pass
+                             commit_summary_details['metrics'] = op_metrics # Store raw metrics
+
+                             # Extract metrics if available, default to 0
+                             commit_summary_details['num_added_files'] = int(op_metrics.get('numOutputFiles', 0))
+                             commit_summary_details['num_removed_files'] = int(op_metrics.get('numRemovedFiles', 0))
+                             commit_summary_details['added_bytes'] = int(op_metrics.get('numOutputBytes', 0))
+                             commit_summary_details['removed_bytes'] = int(op_metrics.get('numTargetFilesRemoved', 0)) # Use Spark 3+ metric if available for removes
+
 
                          elif 'add' in action and action['add']:
                              add_info = action['add']
@@ -925,21 +918,22 @@ def delta_details():
                              if add_info.get('stats'):
                                  try: stats_parsed = json.loads(add_info['stats'])
                                  except: pass
-                             active_files[path] = { 'size': add_info['size'], 'partitionValues': add_info.get('partitionValues', {}), 'modificationTime': mod_time, 'stats': stats_parsed, 'tags': add_info.get('tags') }
-                             # Only increment counts if operationMetrics didn't provide them
+                             active_files[path] = { 'size': add_info.get('size'), 'partitionValues': add_info.get('partitionValues', {}), 'modificationTime': mod_time, 'stats': stats_parsed, 'tags': add_info.get('tags') }
+                             # Increment only if not already counted by commitInfo metrics
                              if 'numOutputFiles' not in op_metrics: commit_summary_details['num_added_files'] += 1
                              if 'numOutputBytes' not in op_metrics: commit_summary_details['added_bytes'] += add_info.get('size', 0)
 
                          elif 'remove' in action and action['remove']:
                              remove_info = action['remove']
                              path = remove_info['path']
-                             if remove_info.get('dataChange', True): # Only count removals that change data
-                                 if path in active_files:
-                                     removed_file_info = active_files.pop(path)
-                                     # Only increment counts if operationMetrics didn't provide them
-                                     if 'numRemovedFiles' not in op_metrics: commit_summary_details['num_removed_files'] += 1
-                                     # removed_bytes is tricky, requires info from the removed file
-                                     commit_summary_details['removed_bytes'] += removed_file_info.get('size', 0) # Add size if available
+                             if remove_info.get('dataChange', True):
+                                 removed_file_info = active_files.pop(path, None) # Remove from active state
+                                 # Increment only if not already counted by commitInfo metrics
+                                 if 'numRemovedFiles' not in op_metrics and 'numTargetFilesRemoved' not in op_metrics:
+                                     commit_summary_details['num_removed_files'] += 1
+                                     if removed_file_info and removed_file_info.get('size'):
+                                          removed_file_sizes_by_commit[version] += removed_file_info.get('size',0)
+
 
                          elif 'metaData' in action and action['metaData']:
                              metadata_from_log = action['metaData']
@@ -948,51 +942,49 @@ def delta_details():
                              protocol_from_log = action['protocol']
                              print(f"DEBUG: Updated protocol from version {version}")
 
+                    # If remove size wasn't in commitInfo, use the sum calculated from 'remove' actions
+                    if 'numTargetBytesRemoved' not in op_metrics and removed_file_sizes_by_commit[version] > 0 :
+                         commit_summary_details['removed_bytes'] = removed_file_sizes_by_commit[version]
+                    # Handle older metric name if present and preferred one isn't
+                    elif 'numRemovedBytes' in op_metrics and 'numTargetBytesRemoved' not in op_metrics:
+                         commit_summary_details['removed_bytes'] = int(op_metrics.get('numRemovedBytes', 0))
+
+
                     all_commit_info[version] = commit_summary_details
 
                 except Exception as json_proc_err:
                     print(f"ERROR: Failed to process commit file {commit_key} for version {version}: {json_proc_err}")
                     traceback.print_exc()
-                    # Store minimal info about the failed commit
                     all_commit_info[version] = {'version': version, 'error': str(json_proc_err)}
 
             print(f"INFO: Finished processing JSON logs.")
 
             # --- 3.5 Find Definitive Metadata & Protocol ---
-            # ...(keep existing backward search logic)...
+            # Logic remains the same - search backwards if needed
             definitive_metadata = metadata_from_log
             definitive_protocol = protocol_from_log
 
             if not definitive_metadata or not definitive_protocol:
                 print("DEBUG: Searching backwards for definitive metadata and/or protocol...")
-                # Ensure we search from the *actual* latest version, even if only checkpoint was loaded
                 start_search_version = current_snapshot_id
-                if checkpoint_version_used is not None and not json_commits:
-                    start_search_version = checkpoint_version_used # Search from checkpoint if no json files
-
-                processed_backward = set() # Avoid reprocessing files if already read forward
+                processed_backward = set() # Avoid reprocessing files
 
                 for v in range(start_search_version, -1, -1):
                     if definitive_metadata and definitive_protocol: break
-                    if v in versions_to_process: # Skip if already processed forward
-                         continue
-                    if v not in json_commits and v != checkpoint_version_used: # Skip if no file exists for this version
-                        continue
+                    if v in versions_to_process: continue # Already checked
+                    if v not in json_commits and v != checkpoint_version_used: continue # No file
 
                     actions_to_check = []
-                    # Prioritize JSON if available for this version
                     if v in json_commits and v not in processed_backward:
                          commit_key = json_commits[v]['key']
                          try:
                              actions_to_check = read_delta_json_lines(s3_client, bucket_name, commit_key, temp_dir)
                              processed_backward.add(v)
-                         except Exception as bk_err: print(f"Warning: Error reading version {v} JSON while searching backwards: {bk_err}")
-                    # If no JSON or error reading it, and it's the checkpoint version, use checkpoint actions
+                         except Exception as bk_err: print(f"Warning: Error reading version {v} JSON backwards: {bk_err}")
                     elif v == checkpoint_version_used and all_checkpoint_actions:
-                         actions_to_check = all_checkpoint_actions # Already read
+                         actions_to_check = all_checkpoint_actions # Use already loaded checkpoint actions
 
-                    # Check actions (JSON preferred, then checkpoint)
-                    for action in reversed(actions_to_check):
+                    for action in reversed(actions_to_check): # Check in reverse order within file
                         if not definitive_metadata and 'metaData' in action and action['metaData']:
                             definitive_metadata = action['metaData']
                             print(f"DEBUG: Found definitive metaData in version {v}")
@@ -1006,16 +998,16 @@ def delta_details():
                 return jsonify({"error": "Could not determine table metadata (schema, partitioning). Invalid Delta table state."}), 500
             if not definitive_protocol:
                 print("Warning: Could not find protocol information. Using defaults.")
-                definitive_protocol = {"minReaderVersion": 1, "minWriterVersion": 2} # Default
+                definitive_protocol = {"minReaderVersion": 1, "minWriterVersion": 2}
 
-            # --- NEW: Assemble Format Configuration ---
+            # --- Assemble Format Configuration ---
             format_configuration = {
-                 **definitive_protocol, # Unpack protocol version info
-                 **(definitive_metadata.get("configuration", {})) # Unpack configuration properties
+                 **definitive_protocol,
+                 **(definitive_metadata.get("configuration", {}))
             }
 
             # --- 3.6 Parse Schema and Format Partition Spec ---
-            # ...(keep existing schema/partition spec parsing)...
+            # Logic remains the same
             table_schema = _parse_delta_schema_string(definitive_metadata.get("schemaString", "{}"))
             if not table_schema: return jsonify({"error": "Failed to parse table schema from metadata."}), 500
             partition_cols = definitive_metadata.get("partitionColumns", [])
@@ -1024,40 +1016,48 @@ def delta_details():
             for i, col_name in enumerate(partition_cols):
                 source_field = schema_fields_map.get(col_name)
                 if source_field:
-                    partition_spec_fields.append({ "name": col_name, "transform": "identity", "source-id": source_field['id'], "field-id": 1000 + i })
+                    partition_spec_fields.append({ "name": col_name, "transform": "identity", "source-id": source_field.get('id', i+1), "field-id": 1000 + i }) # Use generated ID if needed
                 else: print(f"Warning: Partition column '{col_name}' not found in table schema.")
             partition_spec = {"spec-id": 0, "fields": partition_spec_fields}
 
 
-            # --- 4. Calculate Metrics (Aligned with Iceberg) ---
-            # ...(keep existing metric calculations)...
+            # --- 4. Calculate Final State Metrics ---
+            # Logic remains the same
             total_data_files = len(active_files)
-            total_delete_files = 0 # Delta doesn't expose this easily
+            total_delete_files = 0 # Delta specific
             total_data_storage_bytes = sum(f['size'] for f in active_files.values() if f.get('size'))
-            total_delete_storage_bytes = 0 # N/A for Delta
+            total_delete_storage_bytes = 0 # Delta specific
 
             approx_live_records = 0
+            gross_records_in_data_files = 0
             files_missing_stats = 0
             for f in active_files.values():
+                num_recs = 0
+                has_stats = False
                 if f.get('stats') and 'numRecords' in f['stats']:
-                     # Handle potential non-integer values in stats if needed
-                     try: approx_live_records += int(f['stats']['numRecords'])
-                     except (ValueError, TypeError): files_missing_stats += 1
+                    try:
+                         num_recs = int(f['stats']['numRecords'])
+                         has_stats = True
+                         approx_live_records += num_recs # Live records estimate
+                    except (ValueError, TypeError): files_missing_stats += 1
                 else:
                     files_missing_stats += 1
+                # Gross records include counts even if stats are partially missing/unparseable
+                gross_records_in_data_files += num_recs if has_stats else 0
 
-            gross_records_in_data_files = approx_live_records # Best estimate
-            approx_deleted_records_in_manifests = 0 # N/A for Delta
+            # Note: approx_live_records == gross_records_in_data_files with this logic for Delta
+            # as we don't have separate delete file record counts.
+            approx_deleted_records_in_manifests = 0 # Delta specific
 
             avg_live_records_per_data_file = (approx_live_records / total_data_files) if total_data_files > 0 else 0
             avg_data_file_size_mb = (total_data_storage_bytes / (total_data_files or 1) / (1024*1024))
 
             metrics_note = f"Live record count ({approx_live_records}) is an estimate based on available 'numRecords' in Delta file stats."
             if files_missing_stats > 0: metrics_note += f" Stats were missing or unparseable for {files_missing_stats}/{total_data_files} active files."
-            metrics_note += " Delta Lake does not track explicit delete files like Iceberg V2."
+            metrics_note += " Delta Lake does not track explicit delete files/records in metadata like Iceberg V2 (delete file counts/bytes are 0)."
 
-            # --- 5. Calculate Partition Stats (Aligned with Iceberg) ---
-            # ...(keep existing partition stat calculations, add human size)...
+            # --- 5. Calculate Partition Stats ---
+            # Logic remains the same
             partition_stats = {}
             for path, file_info in active_files.items():
                 part_values = file_info.get('partitionValues', {})
@@ -1068,75 +1068,142 @@ def delta_details():
                 partition_stats[part_key_string]["size_bytes"] += file_info.get('size', 0)
                 if file_info.get('stats') and 'numRecords' in file_info['stats']:
                      try: partition_stats[part_key_string]["gross_record_count"] += int(file_info['stats']['numRecords'])
-                     except (ValueError, TypeError): pass # Ignore if record count isn't an int
+                     except (ValueError, TypeError): pass
 
             partition_explorer_data = list(partition_stats.values())
-            # Add human readable size to partition explorer
             for p_data in partition_explorer_data:
                 p_data["size_human"] = format_bytes(p_data["size_bytes"])
             partition_explorer_data.sort(key=lambda x: x.get("partition_key_string", ""))
 
 
             # --- 6. Get Sample Data ---
-            # ...(keep existing sample data logic)...
+            # Logic remains the same
             sample_data = []
             if active_files:
-                sample_file_relative_path = list(active_files.keys())[0] # Get relative path
-                # Construct full key ensuring no double slashes
+                # Try to find a parquet file for sampling
+                sample_file_relative_path = None
+                for p in active_files.keys():
+                    if p.lower().endswith('.parquet'): # Prefer parquet
+                         sample_file_relative_path = p
+                         break
+                if not sample_file_relative_path: # Fallback to first file if no parquet
+                    sample_file_relative_path = list(active_files.keys())[0]
+
                 full_sample_s3_key = table_base_key.rstrip('/') + '/' + sample_file_relative_path.lstrip('/')
                 print(f"INFO: Attempting to get sample data from: s3://{bucket_name}/{full_sample_s3_key}")
                 try:
-                    sample_data = read_parquet_sample(s3_client, bucket_name, full_sample_s3_key, temp_dir, num_rows=5)
+                     if sample_file_relative_path.lower().endswith('.parquet'):
+                         sample_data = read_parquet_sample(s3_client, bucket_name, full_sample_s3_key, temp_dir, num_rows=10)
+                     else:
+                          sample_data = [{"error": "Sampling only implemented for Parquet files", "file_type": os.path.splitext(sample_file_relative_path)[1]}]
+                except FileNotFoundError:
+                     sample_data = [{"error": f"Sample file not found", "details": f"s3://{bucket_name}/{full_sample_s3_key}"}]
                 except Exception as sample_err:
+                    print(f"ERROR: Sampling failed - {sample_err}")
                     sample_data = [{"error": f"Failed to read sample data", "details": str(sample_err)}]
             else: print("INFO: No active data files found to sample.")
 
 
-            # --- 7. Assemble Final Result (Aligned with Iceberg) ---
+            # --- 7. Assemble Final Result ---
             print("\nINFO: Assembling final Delta result...")
 
-            # --- NEW: Assemble Current Snapshot Details ---
-            current_commit_summary = all_commit_info.get(current_snapshot_id, {}) # Get summary for latest version
+            # --- Assemble Current Snapshot Details (Adding total state metrics) ---
+            current_commit_summary = all_commit_info.get(current_snapshot_id, {})
             current_snapshot_details = {
-                 "version": current_snapshot_id,
+                 "version": current_snapshot_id, # Or snapshot-id
                  "timestamp_ms": current_commit_summary.get('timestamp'),
                  "timestamp_iso": format_timestamp_ms(current_commit_summary.get('timestamp')),
                  "operation": current_commit_summary.get('operation', 'N/A'),
                  "operation_parameters": current_commit_summary.get('operationParameters', {}),
+                 # Total state metrics for THIS snapshot
                  "num_files_total_snapshot": total_data_files, # Total active files in this snapshot
-                 "num_added_files_commit": current_commit_summary.get('num_added_files'), # Files added by *this* commit
-                 "num_removed_files_commit": current_commit_summary.get('num_removed_files'), # Files removed by *this* commit
+                 "total_data_files_snapshot": total_data_files, # Alias for consistency
+                 "total_delete_files_snapshot": total_delete_files, # Always 0 for Delta
+                 "total_data_storage_bytes_snapshot": total_data_storage_bytes,
+                 "total_records_snapshot": approx_live_records, # Estimated total records
+                 # Metrics specific to the COMMIT that CREATED this snapshot
+                 "num_added_files_commit": current_commit_summary.get('num_added_files'),
+                 "num_removed_files_commit": current_commit_summary.get('num_removed_files'),
                  "commit_added_bytes": current_commit_summary.get('added_bytes'),
                  "commit_removed_bytes": current_commit_summary.get('removed_bytes'),
-                 "error": current_commit_summary.get('error') # Include error if processing failed
+                 "commit_metrics_raw": current_commit_summary.get('metrics', {}), # Include raw op metrics
+                 "error": current_commit_summary.get('error')
             }
 
-
-            # Format version history (similar to before, but use data from all_commit_info)
+            # --- Assemble Version History ---
             snapshots_overview = []
-            versions_in_history = sorted(list(json_commits.keys()) + ([checkpoint_version_used] if checkpoint_version_used is not None else []), reverse=True)
-            unique_versions_in_history = sorted(list(set(versions_in_history)), reverse=True)
+            # Combine known versions from JSON and Checkpoints, sort descending
+            known_versions = sorted(list(set(list(json_commits.keys()) + ([checkpoint_version_used] if checkpoint_version_used is not None else []))), reverse=True)
 
-            for v in unique_versions_in_history[:min(len(unique_versions_in_history), 10)]: # Limit history
+            # Limit history length for performance/readability
+            history_limit = 20
+            versions_in_history = known_versions[:min(len(known_versions), history_limit)]
+
+            current_snapshot_summary_for_history = None # Store the enhanced summary for the latest snapshot
+
+            for v in versions_in_history:
                 commit_details = all_commit_info.get(v)
                 summary = {}
+
                 if commit_details and not commit_details.get('error'):
                     summary = {
                         "operation": commit_details.get('operation', 'Unknown'),
                         "added-data-files": str(commit_details.get('num_added_files', 'N/A')),
                         "removed-data-files": str(commit_details.get('num_removed_files', 'N/A')),
                         "added-files-size": str(commit_details.get('added_bytes', 'N/A')),
+                        "removed-files-size": str(commit_details.get('removed_bytes', 'N/A')), # Added removed size
                         "operation-parameters": commit_details.get('operationParameters', {})
+                        # Add raw metrics if desired:
+                        # "metrics": commit_details.get('metrics', {})
                     }
+                    # --- ADD TOTALS FOR THE *CURRENT* SNAPSHOT SUMMARY ONLY ---
+                    if v == current_snapshot_id:
+                         summary["total-data-files"] = str(total_data_files)
+                         summary["total-delete-files"] = str(total_delete_files) # 0
+                         summary["total-equality-deletes"] = "0" # N/A for Delta
+                         summary["total-position-deletes"] = "0" # N/A for Delta
+                         summary["total-files-size"] = str(total_data_storage_bytes)
+                         summary["total-records"] = str(approx_live_records) # Best estimate
+                         current_snapshot_summary_for_history = { # Create the separate summary object
+                              "snapshot-id": v,
+                              "timestamp-ms": commit_details.get('timestamp'),
+                              "summary": summary.copy() # Use a copy of the enhanced summary
+                         }
+
                 elif commit_details and commit_details.get('error'):
                      summary = {"error": commit_details.get('error')}
-                elif v == checkpoint_version_used and not commit_details: # If it's checkpoint & no JSON processed
+                elif v == checkpoint_version_used and not commit_details: # Checkpoint only load
                      summary = {"operation": "CHECKPOINT_LOAD", "info": f"State loaded from checkpoint {v}"}
-                else:
-                     summary = {"operation": "Unknown", "info": "Commit details not processed"}
+                     # Add totals if this checkpoint *is* the latest version
+                     if v == current_snapshot_id:
+                           summary["total-data-files"] = str(total_data_files)
+                           summary["total-delete-files"] = str(total_delete_files) # 0
+                           summary["total-equality-deletes"] = "0"
+                           summary["total-position-deletes"] = "0"
+                           summary["total-files-size"] = str(total_data_storage_bytes)
+                           summary["total-records"] = str(approx_live_records)
+                           current_snapshot_summary_for_history = {
+                               "snapshot-id": v,
+                               "timestamp-ms": None, # Timestamp might be unknown if only CP
+                               "summary": summary.copy()
+                           }
+                else: # Should not happen often if all known versions are processed
+                     summary = {"operation": "Unknown", "info": "Commit details missing or not processed"}
+
+                # Don't add totals to historical summaries
+                if v != current_snapshot_id:
+                     # Optionally add placeholders or note lack of totals for historical
+                     summary["total-data-files"] = "N/A (Historical)"
+                     summary["total-files-size"] = "N/A (Historical)"
+                     summary["total-records"] = "N/A (Historical)"
+                     # Add other total fields as "0" or "N/A" for clarity
+                     summary["total-delete-files"] = "0"
+                     summary["total-equality-deletes"] = "0"
+                     summary["total-position-deletes"] = "0"
+
 
                 snapshots_overview.append({
-                    "snapshot-id": v,
+                    "snapshot-id": v, # Use 'snapshot-id' for consistency
                     "timestamp-ms": commit_details.get('timestamp') if commit_details else None,
                     "summary": summary
                 })
@@ -1144,50 +1211,58 @@ def delta_details():
 
             # Final Result Structure
             result = {
-                "table_type": "Delta", # Add type identifier
+                "table_type": "Delta",
                 "table_uuid": definitive_metadata.get("id"),
-                "location": s3_url,
-                # --- NEW SECTIONS ---
-                "format_configuration": format_configuration,
-                "delta_log_files": delta_log_files_info,
-                "current_snapshot_details": current_snapshot_details,
-                # --- EXISTING SECTIONS (potentially keep or restructure) ---
-                "format_version": definitive_protocol.get('minReaderVersion', 1), # Redundant? In format_configuration
-                "current_snapshot_id": current_snapshot_id, # Redundant? In current_snapshot_details
+                "location": s3_url, # Use the input URL maybe? Or construct canonical?
+                # "canonical_location": f"s3://{bucket_name}/{table_base_key}", # Optional: more precise location
+
+                "format_configuration": format_configuration, # Reader/Writer versions, table props
+                "format_version": definitive_protocol.get('minReaderVersion', 1), # Keep for potential direct access
+
+                "delta_log_files": delta_log_files_info, # List of log/checkpoint files found
+
+                "current_snapshot_id": current_snapshot_id, # Top level ID
+                "current_snapshot_details": current_snapshot_details, # Detailed info about latest snapshot
+
                 "table_schema": table_schema,
-                "table_properties": definitive_metadata.get("configuration", {}), # Redundant? In format_configuration
+                "table_properties": definitive_metadata.get("configuration", {}), # Keep for direct access
+
                 "partition_spec": partition_spec,
-                "sort_order": {"order-id": 0, "fields": []}, # Placeholder
+                "sort_order": {"order-id": 0, "fields": []}, # Placeholder for Delta
 
                 "version_history": {
-                    "total_snapshots": current_snapshot_id + 1, # Versions are 0-based index
-                    "current_snapshot_summary": snapshots_overview[0] if snapshots_overview and snapshots_overview[0]['snapshot-id'] == current_snapshot_id else None, # More detailed now in current_snapshot_details
-                    "snapshots_overview": snapshots_overview
+                    "total_snapshots": len(known_versions), # Total versions found
+                    "current_snapshot_summary": current_snapshot_summary_for_history, # Use the enhanced one created earlier
+                    "snapshots_overview": snapshots_overview # List of recent snapshots
                 },
                 "key_metrics": {
+                    # Totals for the CURRENT state
                     "total_data_files": total_data_files,
                     "total_delete_files": total_delete_files, # 0
-                    "gross_records_in_data_files": gross_records_in_data_files,
-                    "approx_deleted_records_in_manifests": approx_deleted_records_in_manifests, # 0
-                    "approx_live_records": approx_live_records,
-                    "metrics_note": metrics_note,
                     "total_data_storage_bytes": total_data_storage_bytes,
-                    "total_data_storage_human": format_bytes(total_data_storage_bytes), # Add human readable
                     "total_delete_storage_bytes": total_delete_storage_bytes, # 0
-                    "total_delete_storage_human": format_bytes(total_delete_storage_bytes), # Add human readable
+                    # Record Counts (Estimates for Delta)
+                    "gross_records_in_data_files": gross_records_in_data_files, # Sum of numRecords from stats
+                    "approx_deleted_records_in_manifests": approx_deleted_records_in_manifests, # 0
+                    "approx_live_records": approx_live_records, # Best estimate of live records
+                    # Averages
                     "avg_live_records_per_data_file": round(avg_live_records_per_data_file, 2),
                     "avg_data_file_size_mb": round(avg_data_file_size_mb, 4),
+                    # Note explaining estimations/differences
+                    "metrics_note": metrics_note,
                 },
-                "partition_explorer": partition_explorer_data,
-                "sample_data": sample_data,
+                "partition_explorer": partition_explorer_data, # Stats per partition
+                "sample_data": sample_data, # Sample rows from one data file
             }
 
+            # Convert any remaining bytes objects (e.g., in sample data if errors occur)
             result_serializable = convert_bytes(result)
+
             end_time = time.time()
             print(f"--- Delta Request Completed in {end_time - start_time:.2f} seconds ---")
             return jsonify(result_serializable), 200
 
-    # --- Keep existing Exception Handling ---
+    # --- Exception Handling (Keep Existing) ---
     except boto3.exceptions.NoCredentialsError:
         print("ERROR: AWS credentials not found.")
         return jsonify({"error": "AWS credentials not found."}), 401
@@ -1200,20 +1275,23 @@ def delta_details():
         print(f"ERROR: AWS ClientError occurred: {error_code} - {e}")
         if error_code == 'AccessDenied':
             return jsonify({"error": f"Access Denied for S3 operation: {e}"}), 403
-        elif error_code == 'NoSuchKey' or error_code == '404': # Check for 404 as well
+        elif error_code == 'NoSuchKey' or error_code == '404':
             log_prefix_info = f" ({delta_log_prefix})" if delta_log_prefix else ""
-            # Be more specific if possible
-            if 'download_s3_file' in traceback.format_exc(): # Check if error happened during download
-                 return jsonify({"error": f"A required Delta log file was not found{log_prefix_info} (NoSuchKey/404 during download): {e}"}), 404
-            else: # Likely happened during initial check or listing
+            if 'download_s3_file' in traceback.format_exc() or 'read_parquet_sample' in traceback.format_exc():
+                 return jsonify({"error": f"A required Delta log/data file was not found{log_prefix_info} (NoSuchKey/404 during download/sampling): {e}"}), 404
+            else:
                  return jsonify({"error": f"Delta log prefix or required file not found{log_prefix_info} (NoSuchKey/404): {e}"}), 404
         else:
             traceback.print_exc()
             return jsonify({"error": f"AWS ClientError: {e}"}), 500
-    except FileNotFoundError as e:
-        print(f"ERROR: FileNotFoundError occurred (likely local issue after download attempt): {e}")
+    except FileNotFoundError as e: # Can be raised by download_s3_file or local file ops
+        print(f"ERROR: FileNotFoundError occurred: {e}")
         traceback.print_exc()
-        return jsonify({"error": f"A required local file was not found during processing: {e}"}), 500
+        # Distinguish between S3 not found and local issue if possible
+        if "S3 object not found" in str(e):
+             return jsonify({"error": f"A required S3 file was not found: {e}"}), 404
+        else:
+             return jsonify({"error": f"A required local file was not found during processing: {e}"}), 500
     except ValueError as e:
        print(f"ERROR: ValueError occurred: {e}")
        traceback.print_exc()
@@ -1222,7 +1300,8 @@ def delta_details():
         print(f"ERROR: An unexpected error occurred during Delta processing: {e}")
         traceback.print_exc()
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
-    
+
+
 
 @app.route('/', methods=['GET'])
 def hello():
