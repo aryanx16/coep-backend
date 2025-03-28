@@ -1,0 +1,10 @@
+# src/requirements.txt
+Flask>=2.0  # Use a recent version
+Flask-Cors>=3.0
+boto3>=1.20
+python-dotenv>=0.19
+fastavro>=1.4
+pyarrow>=7.0  # Or a version compatible with your parquet files
+# numpy is often a dependency of pyarrow, but list if needed directly
+# numpy>=1.20
+# Add any other direct dependencies your code might have
