@@ -185,11 +185,13 @@ def create_storage_client(storage_type, endpoint_url=None, use_ssl=True, region_
 
         # Prioritize MinIO-specific config if endpoint_url is provided
         # Or if MINIO_ENDPOINT_URL is globally set
-        effective_endpoint_url = endpoint_url or MINIO_ENDPOINT_URL
+        print('endpoint url is ', endpoint_url)
+        effective_endpoint_url = endpoint_url
 
         if effective_endpoint_url:
             print(f"DEBUG: Configuring Boto3 client for S3 endpoint: {effective_endpoint_url}")
-            config_kwargs['endpoint_url'] = effective_endpoint_url
+            if(effective_endpoint_url):
+                config_kwargs['endpoint_url'] = effective_endpoint_url
             config_kwargs['use_ssl'] = use_ssl # Use provided or default from env
             # Use MinIO keys if available when endpoint is set
             access_key = MINIO_ACCESS_KEY_ID or AWS_ACCESS_KEY_ID
