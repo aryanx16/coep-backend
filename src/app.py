@@ -1661,6 +1661,131 @@ def compare_delta_schema_endpoint():
                 print(f"ERROR: Failed to cleanup temporary directory {temp_dir_obj.name}: {cleanup_err}")
 
 
+from urllib.parse import urlparse, unquote
+import boto3
+from botocore.exceptions import NoCredentialsError # Make sure this import is present
+# ... other imports ...
+
+# --- NEW Endpoint to List Tables ---
+@app.route('/list_tables', methods=['GET'])
+def list_tables():
+    s3_root_path = request.args.get('s3_root_path')
+    if not s3_root_path:
+        return jsonify({"error": "s3_root_path parameter is missing"}), 400
+
+    print(f"\n--- Processing List Tables Request for {s3_root_path} ---")
+
+    s3_client = None
+    try:
+        # Ensure root path ends with a slash
+        if not s3_root_path.endswith('/'):
+            s3_root_path += '/'
+
+        # Extract bucket and prefix
+        parsed_url = urlparse(s3_root_path)
+        bucket_name = parsed_url.netloc
+        root_prefix = unquote(parsed_url.path).lstrip('/')
+
+        if not s3_root_path.startswith("s3://") or not bucket_name:
+             raise ValueError(f"Invalid S3 root path: {s3_root_path}")
+
+        s3_client = boto3.client('s3', aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
+
+        discovered_tables = []
+        paginator = s3_client.get_paginator('list_objects_v2')
+        print(f"DEBUG: Listing common prefixes under s3://{bucket_name}/{root_prefix}")
+
+        # Use pagination to handle potentially many subdirectories
+        page_iterator = paginator.paginate(Bucket=bucket_name, Prefix=root_prefix, Delimiter='/')
+
+        for page in page_iterator:
+            if 'CommonPrefixes' not in page:
+                continue
+
+            for common_prefix_obj in page['CommonPrefixes']:
+                prefix = common_prefix_obj.get('Prefix')
+                if not prefix: continue
+
+                table_path = f"s3://{bucket_name}/{prefix}"
+                detected_type = "Unknown" # Default
+                print(f"DEBUG: Checking prefix {prefix} for table type...")
+
+                # Check for Delta (_delta_log)
+                try:
+                    delta_check = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=f"{prefix}_delta_log/", MaxKeys=1)
+                    if 'Contents' in delta_check or delta_check.get('KeyCount', 0) > 0:
+                        detected_type = "Delta"
+                        print(f"DEBUG: Found Delta log for {prefix}")
+                        discovered_tables.append({"path": table_path, "type": detected_type})
+                        continue # Found type, move to next prefix
+                except s3_client.exceptions.ClientError as e:
+                     # Ignore access denied on sub-folders for now, just means we can't detect type there
+                     if e.response['Error']['Code'] != 'AccessDenied':
+                          print(f"Warning: S3 error checking Delta log for {prefix}: {e}")
+                except Exception as e: # Catch any other unexpected error during check
+                     print(f"Warning: Unexpected error checking Delta log for {prefix}: {e}")
+
+                # Check for Iceberg (metadata/*.metadata.json) - more specific check
+                try:
+                    iceberg_check = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=f"{prefix}metadata/", MaxKeys=10) # List a few keys
+                    # Check if any file ends with .metadata.json
+                    if any(item.get('Key', '').endswith('.metadata.json') for item in iceberg_check.get('Contents', [])):
+                         detected_type = "Iceberg"
+                         print(f"DEBUG: Found Iceberg metadata for {prefix}")
+                         discovered_tables.append({"path": table_path, "type": detected_type})
+                         continue
+                except s3_client.exceptions.ClientError as e:
+                     if e.response['Error']['Code'] != 'AccessDenied':
+                        print(f"Warning: S3 error checking Iceberg metadata for {prefix}: {e}")
+                except Exception as e:
+                     print(f"Warning: Unexpected error checking Iceberg metadata for {prefix}: {e}")
+
+                # Check for Hudi (.hoodie)
+                try:
+                    hudi_check = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=f"{prefix}.hoodie/", MaxKeys=1)
+                    if 'Contents' in hudi_check or hudi_check.get('KeyCount', 0) > 0:
+                        detected_type = "Hudi"
+                        print(f"DEBUG: Found Hudi metadata for {prefix}")
+                        discovered_tables.append({"path": table_path, "type": detected_type})
+                        continue
+                except s3_client.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] != 'AccessDenied':
+                         print(f"Warning: S3 error checking Hudi metadata for {prefix}: {e}")
+                except Exception as e:
+                    print(f"Warning: Unexpected error checking Hudi metadata for {prefix}: {e}")
+
+                # If no specific type found after checking all, maybe add as Unknown? Optional.
+                # if detected_type == "Unknown":
+                #     print(f"DEBUG: No specific table type found for {prefix}, listing as Unknown.")
+                #     discovered_tables.append({"path": table_path, "type": detected_type})
+
+        print(f"INFO: Found {len(discovered_tables)} potential tables.")
+        return jsonify(discovered_tables)
+
+    # --- Exception Handling ---
+    except NoCredentialsError:
+        return jsonify({"error": "AWS credentials not found or invalid."}), 401
+    except (s3_client.exceptions.NoSuchBucket if s3_client else Exception):
+        # Catch specific NoSuchBucket if s3_client was initialized
+        return jsonify({"error": f"S3 bucket not found or access denied: {bucket_name}"}), 404
+    except (s3_client.exceptions.ClientError if s3_client else Exception) as e:
+        # General S3 client errors
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown') if hasattr(e, 'response') else 'Unknown'
+        # Handle Access Denied specifically for the root path listing
+        if error_code == 'AccessDenied':
+             return jsonify({"error": f"Access denied when listing path: {s3_root_path}"}), 403
+        print(f"ERROR: AWS ClientError listing tables: {error_code} - {e}")
+        traceback.print_exc()
+        return jsonify({"error": f"AWS ClientError ({error_code}) listing tables. Check logs."}), 500
+    except ValueError as e: # Catch invalid S3 path format
+        print(f"ERROR: ValueError listing tables: {e}")
+        return jsonify({"error": f"Invalid input path: {str(e)}"}), 400
+    except Exception as e:
+        print(f"ERROR: An unexpected error occurred while listing tables: {e}")
+        traceback.print_exc()
+        return jsonify({"error": f"An unexpected server error occurred: {str(e)}"}), 500
+
+
 @app.route('/', methods=['GET'])
 def hello():
     return """
