@@ -34,30 +34,6 @@ def get_gemini_response(prompt):
     response = model.generate_content(prompt)
     return response.text
 
-# Define an API endpoint
-@app.route("/generate", methods=["POST"])
-def generate():
-    data = request.get_json()
-
-    # Expecting the JSON input to have a key "comparison"
-    comparison = data.get("comparison", "")
-    if not comparison:
-        return jsonify({"error": "The JSON input must contain a 'comparison' field."}), 400
-
-    # Build a prompt instructing the model to summarize the provided comparison details.
-    prompt = (
-        "You are provided with a comparison between two versions of a system snapshot. "
-        "The following is a detailed comparison between an iceberg and a delta. "
-        "Please provide a concise and clear summary of the key points in this comparison.\n\n"
-        "Comparison Details:\n" + comparison
-    )
-
-    try:
-        summary = get_gemini_response(prompt)
-        return jsonify({"response": summary})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
 def format_bytes(size_bytes):
     """Converts bytes to a human-readable string (KB, MB, GB)."""
     if size_bytes is None:
@@ -1691,11 +1667,6 @@ def compare_delta_schema_endpoint():
                 print(f"ERROR: Failed to cleanup temporary directory {temp_dir_obj.name}: {cleanup_err}")
 
 
-from urllib.parse import urlparse, unquote
-import boto3
-from botocore.exceptions import NoCredentialsError # Make sure this import is present
-# ... other imports ...
-
 # --- NEW Endpoint to List Tables ---
 @app.route('/list_tables', methods=['GET'])
 def list_tables():
@@ -1815,6 +1786,35 @@ def list_tables():
         traceback.print_exc()
         return jsonify({"error": f"An unexpected server error occurred: {str(e)}"}), 500
 
+
+@app.route("/generate-summary", methods=["POST"])
+def generate():
+    data = request.get_json()
+    comparison_details_str = data.get("comparison", "") # Expecting a formatted string
+    v1_label = data.get("v1_label", "Older Version") # Optional: Get version labels for context
+    v2_label = data.get("v2_label", "Newer Version") # Optional
+
+    if not comparison_details_str:
+        return jsonify({"error": "Missing 'comparison' field in request body."}), 400
+
+    # Refined prompt for summarizing statistical changes
+    prompt = (
+        f"Summarize the key statistical changes between two table snapshots: '{v1_label}' and '{v2_label}'.\n\n"
+        "Focus on significant increases or decreases in records, files, size, and deletes. "
+        "Keep the summary concise (2-3 sentences).\n\n"
+        "Change Details:\n"
+        f"{comparison_details_str}"
+    )
+
+    try:
+        # Assuming get_gemini_response handles the API call to Gemini
+        summary = get_gemini_response(prompt)
+        return jsonify({"summary": summary}) # Return summary under 'summary' key
+    except Exception as e:
+        print(f"Error generating summary: {e}") # Log the error server-side
+        traceback.print_exc() # Print full traceback for debugging
+        return jsonify({"error": f"Failed to generate summary: {str(e)}"}), 500
+    
 
 @app.route('/', methods=['GET'])
 def hello():
