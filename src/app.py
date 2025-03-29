@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session, g # Removed redirect, url_for, flash, render_template_string
 import boto3
 import os
 import json
@@ -6,13 +6,17 @@ import tempfile
 import traceback
 import datetime
 from dotenv import load_dotenv
-from fastavro import reader as avro_reader # Keep for Iceberg
+from fastavro import reader as avro_reader
 import pyarrow.parquet as pq
 from urllib.parse import urlparse, unquote
 from flask_cors import CORS
-import re # Needed for Delta log file matching
-import time # Needed for Delta
+import re
+import time
 from botocore.exceptions import NoCredentialsError
+from flask_sqlalchemy import SQLAlchemy
+import bcrypt
+import functools
+from cryptography.fernet import Fernet, InvalidToken # For encryption
 
 load_dotenv()
 
@@ -20,11 +24,236 @@ app = Flask(__name__)
 
 CORS(app)
 
+# --- Flask Configuration ---
+app.config['SECRET_KEY'] = os.getenv("FLASK_SECRET_KEY")
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# Optional: Configure session cookie parameters for security
+app.config['SESSION_COOKIE_SECURE'] = True  # Send cookie only over HTTPS (Requires HTTPS setup)
+app.config['SESSION_COOKIE_HTTPONLY'] = True # Prevent JS access to cookie
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax' # Basic CSRF protection ('Strict' is better but can break cross-origin links)
+
+if not app.config['SECRET_KEY']:
+    raise ValueError("No FLASK_SECRET_KEY set for Flask application")
+if not app.config['SQLALCHEMY_DATABASE_URI']:
+    raise ValueError("No DATABASE_URL set for Flask application")
+
+# --- Encryption Setup ---
+ENCRYPTION_KEY_STR = os.getenv("ENCRYPTION_KEY")
+if not ENCRYPTION_KEY_STR:
+    raise ValueError("No ENCRYPTION_KEY set for URL encryption")
+try:
+    fernet = Fernet(ENCRYPTION_KEY_STR.encode()) # Create Fernet instance
+except Exception as e:
+    raise ValueError(f"Invalid ENCRYPTION_KEY format: {e}")
+
+# --- Initialize SQLAlchemy ---
+db = SQLAlchemy(app)
+
 # --- Configuration ---
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+
+# --- Database Models ---
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    usages = db.relationship('S3Usage', backref='user', lazy=True)
+
+    def set_password(self, password):
+        self.password_hash = bcrypt.hashpw(
+            password.encode('utf-8'), bcrypt.gensalt()
+        ).decode('utf-8')
+
+    def check_password(self, password):
+        if not self.password_hash: return False # Handle case where hash might be null
+        try:
+            return bcrypt.checkpw(
+                password.encode('utf-8'), self.password_hash.encode('utf-8')
+            )
+        except ValueError: # Handle potential errors if hash is malformed
+             return False
+
+class S3Usage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    # Store encrypted URL - might need more space than default String
+    s3_bucket_link_encrypted = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+# --- Encryption Helper Functions ---
+def encrypt_data(data_string):
+    """Encrypts a string using the global Fernet key."""
+    if not isinstance(data_string, str):
+        raise TypeError("Input must be a string")
+    return fernet.encrypt(data_string.encode()).decode() # Encrypt and return as string
+
+def decrypt_data(encrypted_string):
+    """Decrypts a string using the global Fernet key. Returns None on failure."""
+    if not isinstance(encrypted_string, str):
+        # If data in DB isn't string, handle appropriately
+        print(f"Warning: Attempting to decrypt non-string data: {type(encrypted_string)}")
+        return None
+    try:
+        return fernet.decrypt(encrypted_string.encode()).decode()
+    except InvalidToken:
+        print("ERROR: Failed to decrypt data - Invalid Token (key mismatch or corrupted data?)")
+        return None # Or raise an error, or return a specific marker
+    except Exception as e:
+        print(f"ERROR: Decryption failed: {e}")
+        return None
+
+# --- Authentication Middleware/Hooks ---
+@app.before_request
+def load_logged_in_user():
+    """If user_id is stored in the session, load the user object from DB into g.user."""
+    user_id = session.get('user_id')
+    g.user = User.query.get(user_id) if user_id else None
+
+def login_required(func):
+    """Decorator that returns 401 JSON error if user is not logged in."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if g.user is None:
+            return jsonify(error="Authentication required. Please log in."), 401
+        return func(*args, **kwargs)
+    return wrapper
+
+# --- Authentication Routes (JSON API) ---
+
+@app.route('/register', methods=['POST'])
+def register():
+    if g.user: # User is already logged in
+        return jsonify(error="Already logged in"), 400
+
+    data = request.get_json()
+    if not data:
+        return jsonify(error="Invalid JSON payload"), 400
+
+    username = data.get('username')
+    email = data.get('email')
+    password = data.get('password')
+
+    if not username or not email or not password:
+        return jsonify(error="Username, email, and password are required"), 400
+
+    # Check if user already exists
+    if User.query.filter((User.username == username) | (User.email == email)).first():
+        return jsonify(error=f'User with username "{username}" or email "{email}" already exists.'), 409 # 409 Conflict
+
+    try:
+        new_user = User(username=username, email=email)
+        new_user.set_password(password)
+        db.session.add(new_user)
+        db.session.commit()
+        print(f"DEBUG: User registered successfully: {username}")
+        # Return limited user info upon successful registration
+        return jsonify(
+            message="Registration successful",
+            user={'id': new_user.id, 'username': new_user.username, 'email': new_user.email}
+        ), 201 # 201 Created
+    except Exception as e:
+        db.session.rollback()
+        print(f"ERROR: Database error during registration: {e}")
+        traceback.print_exc()
+        return jsonify(error="Registration failed due to a server error."), 500
+
+
+@app.route('/login', methods=['POST'])
+def login():
+    if g.user:
+        return jsonify(error="Already logged in"), 400
+
+    data = request.get_json()
+    if not data:
+        return jsonify(error="Invalid JSON payload"), 400
+
+    username_or_email = data.get('username_or_email')
+    password = data.get('password')
+
+    if not username_or_email or not password:
+         return jsonify(error="Username/email and password are required"), 400
+
+    # Find user
+    user = User.query.filter((User.username == username_or_email) | (User.email == username_or_email)).first()
+
+    if user and user.check_password(password):
+        # Password matches - Log user in
+        session.clear()
+        session['user_id'] = user.id
+        g.user = user # Update g for this request
+        print(f"DEBUG: User logged in successfully: {user.username}")
+        # Return user info (excluding password hash)
+        return jsonify(
+            message="Login successful",
+            user={'id': user.id, 'username': user.username, 'email': user.email}
+        )
+    else:
+        # Invalid credentials
+        print(f"DEBUG: Failed login attempt for: {username_or_email}")
+        return jsonify(error="Invalid username/email or password"), 401 # 401 Unauthorized
+
+@app.route('/logout', methods=['POST'])
+@login_required # Must be logged in to log out
+def logout():
+    user_id = g.user.id # Log who is logging out before clearing
+    session.clear()
+    g.user = None
+    print(f"DEBUG: User {user_id} logged out.")
+    return jsonify(message="Logout successful")
+
+@app.route('/me', methods=['GET'])
+@login_required # Get current user info
+def get_current_user():
+    """Returns information about the currently logged-in user."""
+    return jsonify(
+        user={'id': g.user.id, 'username': g.user.username, 'email': g.user.email}
+    )
+
+# --- Helper to Add Encrypted S3 Usage Record ---
+def add_s3_usage_log(user_id, s3_link):
+    """
+    Encrypts the S3 link and adds a record to the S3Usage table.
+    If a record for the same user and S3 link already exists,
+    it updates the timestamp to the current time instead of inserting a duplicate.
+    """
+    if not user_id or not s3_link:
+        print("Warning: Cannot log S3 usage - missing user_id or s3_link.")
+        return
+    try:
+        # Encrypt the link first, as this is what's stored and queried
+        encrypted_link = encrypt_data(s3_link)
+
+        # Check if an entry already exists for this user and encrypted link
+        existing_usage = S3Usage.query.filter_by(
+            user_id=user_id,
+            s3_bucket_link_encrypted=encrypted_link
+        ).first() # Use first() to get one or None
+
+        if existing_usage:
+            # --- UPDATE Existing Record ---
+            print(f"DEBUG: Updating timestamp for existing S3 usage record for user {user_id}, link starts with: {s3_link[:50]}...")
+            existing_usage.timestamp = datetime.datetime.utcnow() # Update timestamp
+            db.session.commit() # Commit the change
+            print(f"DEBUG: Timestamp updated successfully.")
+        else:
+            # --- INSERT New Record ---
+            print(f"DEBUG: Logging new encrypted S3 usage for user {user_id}, link starts with: {s3_link[:50]}...")
+            usage = S3Usage(user_id=user_id, s3_bucket_link_encrypted=encrypted_link)
+            # timestamp defaults to datetime.datetime.utcnow on creation
+            db.session.add(usage)
+            db.session.commit() # Commit the new record
+            print(f"DEBUG: New S3 usage logged successfully.")
+
+    except Exception as e:
+        db.session.rollback() # Rollback in case of any error during query or commit
+        print(f"ERROR: Failed to log or update S3 usage for user {user_id}, link {s3_link}: {e}")
+        traceback.print_exc()
 
 # --- Helper Functions ---
 
@@ -544,6 +773,7 @@ def compare_schemas(schema1, schema2, version1_label="version1", version2_label=
 # --- Iceberg Endpoint ---
 
 @app.route('/Iceberg', methods=['GET'])
+@login_required
 def iceberg_details():
     s3_url = request.args.get('s3_url')
     if not s3_url: return jsonify({"error": "s3_url parameter is missing"}), 400
@@ -935,6 +1165,7 @@ def iceberg_details():
                 "sample_data": sample_data,
             }
 
+            add_s3_usage_log(g.user.id, s3_url) # Log after success
             result_serializable = convert_bytes(result)
             end_time = time.time()
             print(f"--- Iceberg Request Completed in {end_time - start_time:.2f} seconds ---")
@@ -965,9 +1196,11 @@ def iceberg_details():
 # --- Delta Lake Endpoint (Modified) ---
 
 @app.route('/Delta', methods=['GET'])
+@login_required
 def delta_details():
     s3_url = request.args.get('s3_url')
-    if not s3_url: return jsonify({"error": "s3_url parameter is missing"}), 400
+    if not s3_url: 
+        return jsonify({"error": "s3_url parameter is missing"}), 400
 
     start_time = time.time()
     print(f"\n--- Processing Delta Request for {s3_url} ---")
@@ -1436,7 +1669,7 @@ def delta_details():
                 "partition_explorer": partition_explorer_data,
                 "sample_data": sample_data,
             }
-
+            add_s3_usage_log(g.user.id, s3_url)
             result_serializable = json.loads(json.dumps(convert_bytes(result), default=str))
             end_time = time.time()
             print(f"--- Delta Request Completed in {end_time - start_time:.2f} seconds ---")
@@ -1469,14 +1702,18 @@ def delta_details():
 # --- NEW Schema Comparison Endpoint ---
 
 @app.route('/compare_schema/Iceberg', methods=['GET'])
+@login_required
 def compare_iceberg_schema_endpoint():
     s3_url = request.args.get('s3_url')
     seq1_str = request.args.get('seq1') # Use 'seq1' for sequence number
     seq2_str = request.args.get('seq2') # Use 'seq2' for sequence number
 
-    if not s3_url: return jsonify({"error": "s3_url parameter is missing"}), 400
-    if not seq1_str: return jsonify({"error": "seq1 (sequence number) parameter is missing"}), 400
-    if not seq2_str: return jsonify({"error": "seq2 (sequence number) parameter is missing"}), 400
+    if not s3_url: 
+        return jsonify({"error": "s3_url parameter is missing"}), 400
+    if not seq1_str: 
+        return jsonify({"error": "seq1 (sequence number) parameter is missing"}), 400
+    if not seq2_str: 
+        return jsonify({"error": "seq2 (sequence number) parameter is missing"}), 400
 
     start_time = time.time()
     print(f"\n--- Processing Iceberg Schema Comparison Request for {s3_url} (seq {seq1_str} vs seq {seq2_str}) ---")
@@ -1565,6 +1802,7 @@ def compare_iceberg_schema_endpoint():
 # --- NEW Delta Schema Comparison Endpoint ---
 
 @app.route('/compare_schema/Delta', methods=['GET'])
+@login_required
 def compare_delta_schema_endpoint():
     s3_url = request.args.get('s3_url')
     v1_str = request.args.get('v1') # Use 'v1' for version ID
@@ -1661,13 +1899,8 @@ def compare_delta_schema_endpoint():
                 print(f"ERROR: Failed to cleanup temporary directory {temp_dir_obj.name}: {cleanup_err}")
 
 
-from urllib.parse import urlparse, unquote
-import boto3
-from botocore.exceptions import NoCredentialsError # Make sure this import is present
-# ... other imports ...
-
-# --- NEW Endpoint to List Tables ---
 @app.route('/list_tables', methods=['GET'])
+@login_required
 def list_tables():
     s3_root_path = request.args.get('s3_root_path')
     if not s3_root_path:
@@ -1785,17 +2018,51 @@ def list_tables():
         traceback.print_exc()
         return jsonify({"error": f"An unexpected server error occurred: {str(e)}"}), 500
 
+@app.route('/recent_usage', methods=['GET'])
+@login_required
+def recent_usage():
+    """Returns the recent S3 paths accessed by the logged-in user."""
+    print(f"--- Fetching recent usage for User {g.user.id} ---")
+    try:
+        # <<< This query already sorts by timestamp descending (most recent first) >>>
+        usages = S3Usage.query.filter_by(user_id=g.user.id)\
+                              .order_by(S3Usage.timestamp.desc())\
+                              .limit(20).all() # Limit to last 20
 
-@app.route('/', methods=['GET'])
-def hello():
-    return """
-    Hello! Available endpoints:
-     - /Iceberg?s3_url=&lt;s3://your-bucket/path/to/iceberg-table/&gt;
-     - /Delta?s3_url=&lt;s3://your-bucket/path/to/delta-table/&gt;
-    """
+        usage_list = []
+        for usage in usages:
+            decrypted_path = decrypt_data(usage.s3_bucket_link_encrypted)
+            usage_list.append({
+                "path": decrypted_path if decrypted_path else "[Decryption Failed]",
+                "timestamp": usage.timestamp.isoformat() + 'Z' # ISO 8601 UTC format
+            })
+        return jsonify(usage_list)
+
+    except Exception as e:
+        print(f"ERROR User {g.user.id}: Failed to retrieve usage history: {e}")
+        traceback.print_exc()
+        return jsonify({"error": "Failed to retrieve usage history"}), 500
+
+@app.route('/ping', methods=['GET'])
+def root():
+     # Public endpoint, no login required
+     return jsonify(status="API is running", timestamp=datetime.datetime.utcnow().isoformat() + 'Z')
 
 if __name__ == '__main__':
-    # Set host='0.0.0.0' to allow connections from other machines on the network
-    # Use debug=True for development (auto-reloads, provides debugger)
-    # Set debug=False for production deployments
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    with app.app_context():
+        print("Initializing database...")
+        try:
+            db.create_all() # Create tables based on models if they don't exist
+            print("Database tables checked/created.")
+        except Exception as e:
+            print(f"ERROR: Could not connect to or initialize database '{app.config['SQLALCHEMY_DATABASE_URI']}': {e}")
+            print("Please ensure the database exists and connection details are correct in DATABASE_URL.")
+            # Consider exiting if DB is essential: import sys; sys.exit(1)
+
+    if not app.config['SECRET_KEY'] or app.config['SECRET_KEY'] == 'default-insecure-key':
+       print("\nWARNING: Flask SECRET_KEY is not set or is insecure. Set FLASK_SECRET_KEY environment variable for production!\n")
+    if not os.getenv("ENCRYPTION_KEY"):
+        print("\nWARNING: ENCRYPTION_KEY is not set. S3 URL encryption will fail.\n")
+
+    print("Starting Flask server...")
+    app.run(debug=True, host='0.0.0.0', port=5000) # Use debug=False and Gunicorn/uWSGI for production
