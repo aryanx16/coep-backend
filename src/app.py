@@ -30,7 +30,7 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 # --- Helper Functions ---
 def get_gemini_response(prompt):
-    model = genai.GenerativeModel("gemini-2.0-pro-exp")  # Use "gemini-pro" for text-based tasks
+    model = genai.GenerativeModel("gemini-2.0-flash-lite")  # Use "gemini-pro" for text-based tasks
     response = model.generate_content(prompt)
     return response.text
 
@@ -1799,11 +1799,13 @@ def generate():
 
     # Refined prompt for summarizing statistical changes
     prompt = (
-        f"Summarize the key statistical changes between two table snapshots: '{v1_label}' and '{v2_label}'.\n\n"
-        "Focus on significant increases or decreases in records, files, size, and deletes. "
-        "Keep the summary concise (2-3 sentences).\n\n"
-        "Change Details:\n"
-        f"{comparison_details_str}"
+    f"Summarize the key statistical changes between two table snapshots: '{v1_label}' and '{v2_label}', based on the details below.\n\n"
+    "Focus on significant increases or decreases in records, files, size, and deletes mentioned in the details. "
+    "Keep the summary concise (1 sentence, maximum 2). "
+    "The final output must be *only* the HTML paragraph itself, starting with `<p>` and ending with `</p>`. "
+    "Use `<strong></strong>` tags for the keywords.\n\n"
+    "Change Details:\n"
+    f"{comparison_details_str}"
     )
 
     try:
