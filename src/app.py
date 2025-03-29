@@ -13,9 +13,11 @@ from flask_cors import CORS
 import re # Needed for Delta log file matching
 import time # Needed for Delta
 from botocore.exceptions import NoCredentialsError
-
+import google.generativeai as genai
 load_dotenv()
-
+API_KEY = os.getenv("GEMINI_API_KEY")
+# Configure Gemini API
+genai.configure(api_key=API_KEY)
 app = Flask(__name__)
 
 CORS(app)
@@ -27,7 +29,35 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 # --- Helper Functions ---
+def get_gemini_response(prompt):
+    model = genai.GenerativeModel("gemini-2.0-pro-exp")  # Use "gemini-pro" for text-based tasks
+    response = model.generate_content(prompt)
+    return response.text
 
+# Define an API endpoint
+@app.route("/generate", methods=["POST"])
+def generate():
+    data = request.get_json()
+
+    # Expecting the JSON input to have a key "comparison"
+    comparison = data.get("comparison", "")
+    if not comparison:
+        return jsonify({"error": "The JSON input must contain a 'comparison' field."}), 400
+
+    # Build a prompt instructing the model to summarize the provided comparison details.
+    prompt = (
+        "You are provided with a comparison between two versions of a system snapshot. "
+        "The following is a detailed comparison between an iceberg and a delta. "
+        "Please provide a concise and clear summary of the key points in this comparison.\n\n"
+        "Comparison Details:\n" + comparison
+    )
+
+    try:
+        summary = get_gemini_response(prompt)
+        return jsonify({"response": summary})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
 def format_bytes(size_bytes):
     """Converts bytes to a human-readable string (KB, MB, GB)."""
     if size_bytes is None:
