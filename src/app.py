@@ -1,10 +1,12 @@
-from flask import Flask, request, jsonify, session, g # Removed redirect, url_for, flash, render_template_string
+from flask import Flask, request, jsonify, session, g
 import boto3
+from botocore.exceptions import ClientError, NoCredentialsError # Added ClientError
 import os
 import json
 import tempfile
 import traceback
 import datetime
+import uuid # Added for unique session names
 from dotenv import load_dotenv
 from fastavro import reader as avro_reader
 import pyarrow.parquet as pq
@@ -16,7 +18,7 @@ from botocore.exceptions import NoCredentialsError
 from flask_sqlalchemy import SQLAlchemy
 import bcrypt
 import functools
-from cryptography.fernet import Fernet, InvalidToken # For encryption
+from cryptography.fernet import Fernet, InvalidToken
 
 load_dotenv()
 
@@ -52,10 +54,7 @@ db = SQLAlchemy(app)
 
 # --- Configuration ---
 
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-
+AWS_REGION = os.getenv("AWS_REGION", "ap-south-1") # Set default region (e.g., Mumbai)
 
 # --- Database Models ---
 class User(db.Model):
@@ -63,6 +62,7 @@ class User(db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(128), nullable=False)
+    aws_role_arn = db.Column(db.String(255), nullable=True)
     usages = db.relationship('S3Usage', backref='user', lazy=True)
 
     def set_password(self, password):
@@ -138,31 +138,62 @@ def register():
     username = data.get('username')
     email = data.get('email')
     password = data.get('password')
+    # --- Get optional aws_role_arn ---
+    aws_role_arn = data.get('aws_role_arn', None) # Default to None if not provided
 
     if not username or not email or not password:
         return jsonify(error="Username, email, and password are required"), 400
 
-    # Check if user already exists
+    # --- Validate optional aws_role_arn format ---
+    validated_arn = None
+    if aws_role_arn and aws_role_arn.strip(): # Check if provided and not just whitespace
+        validated_arn = aws_role_arn.strip()
+        # Basic ARN format validation (adjust regex as needed for stricter validation)
+        # Checks for: arn:aws:iam::<12 digits>:role/<role name path>
+        arn_pattern = r"^arn:aws:iam::\d{12}:role\/[\w+=,.@\/-]+$"
+        if not re.match(arn_pattern, validated_arn):
+            print(f"DEBUG: Invalid ARN format provided during registration: {validated_arn}")
+            return jsonify(error="Invalid AWS Role ARN format provided."), 400
+    # --- End ARN Validation ---
+
+    # Check if user already exists (by username or email)
     if User.query.filter((User.username == username) | (User.email == email)).first():
         return jsonify(error=f'User with username "{username}" or email "{email}" already exists.'), 409 # 409 Conflict
 
     try:
-        new_user = User(username=username, email=email)
-        new_user.set_password(password)
+        # --- Create user, including the validated ARN (which might be None) ---
+        new_user = User(
+            username=username,
+            email=email,
+            aws_role_arn=validated_arn # Pass the validated ARN or None
+        )
+        new_user.set_password(password) # Set password hash
+        # ----------------------------------------------------------------------
+
         db.session.add(new_user)
         db.session.commit()
-        print(f"DEBUG: User registered successfully: {username}")
+        print(f"DEBUG: User registered successfully: {username}, ARN provided: {'Yes' if validated_arn else 'No'}")
+
         # Return limited user info upon successful registration
+        user_info = {
+            'id': new_user.id,
+            'username': new_user.username,
+            'email': new_user.email
+        }
+        # Include ARN in response only if it was set
+        if new_user.aws_role_arn:
+            user_info['aws_role_arn'] = new_user.aws_role_arn
+
         return jsonify(
             message="Registration successful",
-            user={'id': new_user.id, 'username': new_user.username, 'email': new_user.email}
+            user=user_info
         ), 201 # 201 Created
+
     except Exception as e:
         db.session.rollback()
         print(f"ERROR: Database error during registration: {e}")
         traceback.print_exc()
         return jsonify(error="Registration failed due to a server error."), 500
-
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -214,6 +245,59 @@ def get_current_user():
     return jsonify(
         user={'id': g.user.id, 'username': g.user.username, 'email': g.user.email}
     )
+
+def get_s3_client_for_user(user_role_arn):
+    """
+    Assumes the user's specified role and returns a temporary S3 client.
+    Uses the application's default credentials (from Render env vars) to call STS.
+    Returns None on failure.
+    """
+    if not user_role_arn:
+        print(f"ERROR User {g.user.id}: Cannot assume role, Role ARN is missing.")
+        return None
+
+    try:
+        # 1. Create STS client using the application's credentials (from Render env vars)
+        # Boto3 automatically finds credentials from env vars: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+        sts_client = boto3.client('sts', region_name=AWS_REGION) # Use default region from config
+
+        session_name = f"LakeInsightSession-{g.user.id}-{uuid.uuid4()}"
+        print(f"DEBUG User {g.user.id}: Attempting to assume role: {user_role_arn} with session: {session_name}")
+
+        # 2. Assume the role in the user's account
+        assumed_role_object = sts_client.assume_role(
+            RoleArn=user_role_arn,
+            RoleSessionName=session_name
+            # Add ExternalId=user_external_id here if you implement external IDs
+        )
+
+        # 3. Extract temporary credentials
+        temp_credentials = assumed_role_object['Credentials']
+        print(f"DEBUG User {g.user.id}: Successfully assumed role {user_role_arn}. Credentials expire at {temp_credentials['Expiration']}")
+
+        # 4. Create S3 client using the temporary credentials
+        s3_temp_client = boto3.client(
+            's3',
+            aws_access_key_id=temp_credentials['AccessKeyId'],
+            aws_secret_access_key=temp_credentials['SecretAccessKey'],
+            aws_session_token=temp_credentials['SessionToken'],
+            # Use the default region, or specify user bucket region if needed/known
+            # region_name=AWS_REGION
+            # For S3, region often doesn't matter for basic operations unless using regional features like acceleration
+        )
+        return s3_temp_client
+
+    except ClientError as error:
+        error_code = error.response.get('Error', {}).get('Code')
+        print(f"ERROR User {g.user.id}: Could not assume role {user_role_arn}. Code: {error_code}. Message: {error}")
+        if error_code == 'AccessDenied':
+             print("-> Access Denied: Check Role ARN validity, Trust Policy in customer's account (Principal must be app's IAM User ARN), and External ID (if used).")
+        # Add more specific error handling if needed
+        return None
+    except Exception as e:
+         print(f"ERROR User {g.user.id}: Unexpected error assuming role {user_role_arn}. Error: {e}")
+         traceback.print_exc()
+         return None
 
 # --- Helper to Add Encrypted S3 Usage Record ---
 def add_s3_usage_log(user_id, s3_link):
@@ -779,20 +863,24 @@ def iceberg_details():
     if not s3_url: return jsonify({"error": "s3_url parameter is missing"}), 400
 
     start_time = time.time()
-    print(f"\n--- Processing Iceberg Request for {s3_url} ---")
+    print(f"\n--- Processing Iceberg Request for User {g.user.id}, URL {s3_url} ---")
 
-    bucket_name = None
-    table_base_key = None
-    s3_client = None # Initialize
+    bucket_name, table_base_key, s3_client = None, None, None
+
+    user_role_arn = g.user.aws_role_arn
+    if not user_role_arn: 
+        return jsonify({"error": "AWS Role ARN not configured for this user."}), 400
+    s3_client = get_s3_client_for_user(user_role_arn) # Get temporary client
+    if not s3_client: 
+        return jsonify({"error": "Failed to access AWS Role. Please verify configuration."}), 403
 
     try:
         bucket_name, table_base_key = extract_bucket_and_key(s3_url)
         if not table_base_key.endswith('/'): table_base_key += '/'
         metadata_prefix = table_base_key + "metadata/"
-        s3_client = boto3.client('s3', aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
 
         with tempfile.TemporaryDirectory(prefix="iceberg_meta_") as temp_dir:
-            print(f"DEBUG: Using temporary directory: {temp_dir}")
+            print(f"DEBUG User {g.user.id}: Using temporary directory: {temp_dir}")
             iceberg_manifest_files_info = [] # Stores info about manifest list/files
 
             # 1. Find latest metadata.json
@@ -1210,14 +1298,19 @@ def delta_details():
     delta_log_prefix = None
     s3_client = None
 
+    user_role_arn = g.user.aws_role_arn
+    if not user_role_arn: 
+        return jsonify({"error": "AWS Role ARN not configured for this user."}), 400
+    s3_client = get_s3_client_for_user(user_role_arn) # Get temporary client
+    if not s3_client: 
+        return jsonify({"error": "Failed to access AWS Role. Please verify configuration."}), 403
+
     try:
         bucket_name, table_base_key = extract_bucket_and_key(s3_url)
         if not table_base_key.endswith('/'): table_base_key += '/'
         delta_log_prefix = table_base_key + "_delta_log/"
-        print(f"INFO: Processing Delta Lake table at: s3://{bucket_name}/{table_base_key}")
-
-        s3_client = boto3.client('s3', aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
-
+        print(f"INFO User {g.user.id}: Processing Delta Lake table at: s3://{bucket_name}/{table_base_key}")
+        
         with tempfile.TemporaryDirectory(prefix="delta_meta_") as temp_dir:
             print(f"DEBUG: Using temporary directory: {temp_dir}")
 
@@ -1730,23 +1823,17 @@ def compare_iceberg_schema_endpoint():
         return jsonify({"error": "seq1 and seq2 must be integers."}), 400
 
     try:
-        bucket_name, table_base_key = extract_bucket_and_key(s3_url)
-        if not table_base_key.endswith('/'): table_base_key += '/'
-
-        s3_client = boto3.client('s3', aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
+        bucket_name, table_base_key = extract_bucket_and_key(request.args.get('s3_url')) # Example
+        if not table_base_key.endswith('/'): 
+            table_base_key += '/'
 
         temp_dir_obj = tempfile.TemporaryDirectory(prefix="iceberg_schema_comp_")
         temp_dir = temp_dir_obj.name
-        print(f"DEBUG: Using temporary directory: {temp_dir}")
 
-        # --- Get Schemas ---
-        version1_label = f"sequence_number {seq1}"
-        version2_label = f"sequence_number {seq2}"
+        # --- Use temporary s3_client for helpers ---
         schema1 = get_iceberg_schema_for_version(s3_client, bucket_name, table_base_key, seq1, temp_dir)
         schema2 = get_iceberg_schema_for_version(s3_client, bucket_name, table_base_key, seq2, temp_dir)
-
-        # --- Compare Schemas ---
-        schema_diff = compare_schemas(schema1, schema2, version1_label, version2_label)
+        schema_diff = compare_schemas(schema1, schema2, f"seq {seq1}", f"seq {seq2}")
 
         # --- Assemble Result ---
         result = {
@@ -1808,9 +1895,12 @@ def compare_delta_schema_endpoint():
     v1_str = request.args.get('v1') # Use 'v1' for version ID
     v2_str = request.args.get('v2') # Use 'v2' for version ID
 
-    if not s3_url: return jsonify({"error": "s3_url parameter is missing"}), 400
-    if not v1_str: return jsonify({"error": "v1 (version ID) parameter is missing"}), 400
-    if not v2_str: return jsonify({"error": "v2 (version ID) parameter is missing"}), 400
+    if not s3_url: 
+        return jsonify({"error": "s3_url parameter is missing"}), 400
+    if not v1_str: 
+        return jsonify({"error": "v1 (version ID) parameter is missing"}), 400
+    if not v2_str: 
+        return jsonify({"error": "v2 (version ID) parameter is missing"}), 400
 
     start_time = time.time()
     print(f"\n--- Processing Delta Schema Comparison Request for {s3_url} (v{v1_str} vs v{v2_str}) ---")
@@ -1820,17 +1910,18 @@ def compare_delta_schema_endpoint():
     s3_client = None
     temp_dir_obj = None
 
-    try:
-        v1 = int(v1_str)
-        v2 = int(v2_str)
-    except ValueError:
-        return jsonify({"error": "v1 and v2 must be integers."}), 400
+    user_role_arn = g.user.aws_role_arn
+    if not user_role_arn: return jsonify({"error": "AWS Role ARN not configured."}), 400
+    s3_client = get_s3_client_for_user(user_role_arn)
+    if not s3_client: 
+        return jsonify({"error": "Failed to assume AWS Role."}), 403
 
     try:
-        bucket_name, table_base_key = extract_bucket_and_key(s3_url)
-        if not table_base_key.endswith('/'): table_base_key += '/'
-
-        s3_client = boto3.client('s3', aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
+        v1 = int(request.args.get('v1'))
+        v2 = int(request.args.get('v2')) # Example
+        bucket_name, table_base_key = extract_bucket_and_key(request.args.get('s3_url')) # Example
+        if not table_base_key.endswith('/'): 
+            table_base_key += '/'
 
         temp_dir_obj = tempfile.TemporaryDirectory(prefix="delta_schema_comp_")
         temp_dir = temp_dir_obj.name
@@ -1906,15 +1997,29 @@ def list_tables():
     if not s3_root_path:
         return jsonify({"error": "s3_root_path parameter is missing"}), 400
 
-    print(f"\n--- Processing List Tables Request for {s3_root_path} ---")
+    start_time = time.time()
+    print(f"\n--- Processing List Tables Request for User {g.user.id}, Path {s3_root_path} ---")
 
-    s3_client = None
+    bucket_name = None
+    root_prefix = None
+    s3_client = None # Will hold the temporary client
+
+    # --- AssumeRole Integration START ---
+    user_role_arn = g.user.aws_role_arn
+    if not user_role_arn:
+         print(f"ERROR User {g.user.id}: AWS Role ARN not configured.")
+         return jsonify({"error": "AWS Role ARN not configured for this user."}), 400
+
+    s3_client = get_s3_client_for_user(user_role_arn)
+    if not s3_client:
+        print(f"ERROR User {g.user.id}: Failed to assume AWS Role {user_role_arn}.")
+        # Provide a more user-friendly message maybe
+        return jsonify({"error": "Failed to access AWS Role. Please verify configuration in your AWS account (Role ARN, Trust Policy) and ensure it's correctly saved here."}), 403 # Forbidden
+    # --- AssumeRole Integration END ---
+
     try:
-        # Ensure root path ends with a slash
-        if not s3_root_path.endswith('/'):
-            s3_root_path += '/'
-
-        # Extract bucket and prefix
+        # Use the temporary s3_client obtained above
+        if not s3_root_path.endswith('/'): s3_root_path += '/'
         parsed_url = urlparse(s3_root_path)
         bucket_name = parsed_url.netloc
         root_prefix = unquote(parsed_url.path).lstrip('/')
@@ -1922,101 +2027,103 @@ def list_tables():
         if not s3_root_path.startswith("s3://") or not bucket_name:
              raise ValueError(f"Invalid S3 root path: {s3_root_path}")
 
-        s3_client = boto3.client('s3', aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
-
         discovered_tables = []
         paginator = s3_client.get_paginator('list_objects_v2')
-        print(f"DEBUG: Listing common prefixes under s3://{bucket_name}/{root_prefix}")
+        print(f"DEBUG User {g.user.id}: Listing common prefixes under s3://{bucket_name}/{root_prefix} using assumed role")
 
-        # Use pagination to handle potentially many subdirectories
         page_iterator = paginator.paginate(Bucket=bucket_name, Prefix=root_prefix, Delimiter='/')
 
+        processed_prefixes = set() # Handle potential pagination duplicates if any
+
         for page in page_iterator:
-            if 'CommonPrefixes' not in page:
-                continue
+            if 'CommonPrefixes' in page:
+                for common_prefix_obj in page['CommonPrefixes']:
+                    prefix = common_prefix_obj.get('Prefix')
+                    if not prefix or prefix in processed_prefixes: continue
+                    processed_prefixes.add(prefix)
 
-            for common_prefix_obj in page['CommonPrefixes']:
-                prefix = common_prefix_obj.get('Prefix')
-                if not prefix: continue
+                    table_path = f"s3://{bucket_name}/{prefix}"
+                    detected_type = "Unknown" # Default
+                    print(f"DEBUG User {g.user.id}: Checking prefix {prefix} for table type...")
 
-                table_path = f"s3://{bucket_name}/{prefix}"
-                detected_type = "Unknown" # Default
-                print(f"DEBUG: Checking prefix {prefix} for table type...")
+                    # Check for Delta (_delta_log) - Use temporary client
+                    try:
+                        delta_check = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=f"{prefix}_delta_log/", MaxKeys=1)
+                        if 'Contents' in delta_check or delta_check.get('KeyCount', 0) > 0:
+                            detected_type = "Delta"
+                            print(f"DEBUG User {g.user.id}: Found Delta log for {prefix}")
+                            discovered_tables.append({"path": table_path, "type": detected_type})
+                            continue # Found type, move to next prefix
+                    except ClientError as e:
+                        if e.response['Error']['Code'] != 'AccessDenied': # Log if not just access denied
+                            print(f"Warning User {g.user.id}: S3 error checking Delta log for {prefix}: {e}")
+                        else: 
+                            print(f"DEBUG User {g.user.id}: Access denied checking Delta log for {prefix} (expected if no log)")
+                    except Exception as e: 
+                        print(f"Warning User {g.user.id}: Unexpected error checking Delta log for {prefix}: {e}")
 
-                # Check for Delta (_delta_log)
-                try:
-                    delta_check = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=f"{prefix}_delta_log/", MaxKeys=1)
-                    if 'Contents' in delta_check or delta_check.get('KeyCount', 0) > 0:
-                        detected_type = "Delta"
-                        print(f"DEBUG: Found Delta log for {prefix}")
-                        discovered_tables.append({"path": table_path, "type": detected_type})
-                        continue # Found type, move to next prefix
-                except s3_client.exceptions.ClientError as e:
-                     # Ignore access denied on sub-folders for now, just means we can't detect type there
-                     if e.response['Error']['Code'] != 'AccessDenied':
-                          print(f"Warning: S3 error checking Delta log for {prefix}: {e}")
-                except Exception as e: # Catch any other unexpected error during check
-                     print(f"Warning: Unexpected error checking Delta log for {prefix}: {e}")
+                    # Check for Iceberg (metadata/*.metadata.json) - Use temporary client
+                    try:
+                        iceberg_check = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=f"{prefix}metadata/", MaxKeys=10)
+                        if any(item.get('Key', '').endswith('.metadata.json') for item in iceberg_check.get('Contents', [])):
+                             detected_type = "Iceberg"
+                             print(f"DEBUG User {g.user.id}: Found Iceberg metadata for {prefix}")
+                             discovered_tables.append({"path": table_path, "type": detected_type})
+                             continue
+                    except ClientError as e:
+                        if e.response['Error']['Code'] != 'AccessDenied':
+                            print(f"Warning User {g.user.id}: S3 error checking Iceberg metadata for {prefix}: {e}")
+                        else: 
+                            print(f"DEBUG User {g.user.id}: Access denied checking Iceberg metadata for {prefix}")
+                    except Exception as e: 
+                        print(f"Warning User {g.user.id}: Unexpected error checking Iceberg metadata for {prefix}: {e}")
 
-                # Check for Iceberg (metadata/*.metadata.json) - more specific check
-                try:
-                    iceberg_check = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=f"{prefix}metadata/", MaxKeys=10) # List a few keys
-                    # Check if any file ends with .metadata.json
-                    if any(item.get('Key', '').endswith('.metadata.json') for item in iceberg_check.get('Contents', [])):
-                         detected_type = "Iceberg"
-                         print(f"DEBUG: Found Iceberg metadata for {prefix}")
-                         discovered_tables.append({"path": table_path, "type": detected_type})
-                         continue
-                except s3_client.exceptions.ClientError as e:
-                     if e.response['Error']['Code'] != 'AccessDenied':
-                        print(f"Warning: S3 error checking Iceberg metadata for {prefix}: {e}")
-                except Exception as e:
-                     print(f"Warning: Unexpected error checking Iceberg metadata for {prefix}: {e}")
+                    # Check for Hudi (.hoodie) - Use temporary client
+                    try:
+                        hudi_check = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=f"{prefix}.hoodie/", MaxKeys=1)
+                        if 'Contents' in hudi_check or hudi_check.get('KeyCount', 0) > 0:
+                            detected_type = "Hudi"
+                            print(f"DEBUG User {g.user.id}: Found Hudi metadata for {prefix}")
+                            discovered_tables.append({"path": table_path, "type": detected_type})
+                            continue
+                    except ClientError as e:
+                        if e.response['Error']['Code'] != 'AccessDenied':
+                            print(f"Warning User {g.user.id}: S3 error checking Hudi metadata for {prefix}: {e}")
+                        else: 
+                            print(f"DEBUG User {g.user.id}: Access denied checking Hudi metadata for {prefix}")
+                    except Exception as e: 
+                        print(f"Warning User {g.user.id}: Unexpected error checking Hudi metadata for {prefix}: {e}")
 
-                # Check for Hudi (.hoodie)
-                try:
-                    hudi_check = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=f"{prefix}.hoodie/", MaxKeys=1)
-                    if 'Contents' in hudi_check or hudi_check.get('KeyCount', 0) > 0:
-                        detected_type = "Hudi"
-                        print(f"DEBUG: Found Hudi metadata for {prefix}")
-                        discovered_tables.append({"path": table_path, "type": detected_type})
-                        continue
-                except s3_client.exceptions.ClientError as e:
-                    if e.response['Error']['Code'] != 'AccessDenied':
-                         print(f"Warning: S3 error checking Hudi metadata for {prefix}: {e}")
-                except Exception as e:
-                    print(f"Warning: Unexpected error checking Hudi metadata for {prefix}: {e}")
+                    # Optionally add Unknown types if needed
+                    # if detected_type == "Unknown":
+                    #     print(f"DEBUG User {g.user.id}: No specific table type found for {prefix}, listing as Unknown.")
+                    #     discovered_tables.append({"path": table_path, "type": detected_type})
 
-                # If no specific type found after checking all, maybe add as Unknown? Optional.
-                # if detected_type == "Unknown":
-                #     print(f"DEBUG: No specific table type found for {prefix}, listing as Unknown.")
-                #     discovered_tables.append({"path": table_path, "type": detected_type})
 
-        print(f"INFO: Found {len(discovered_tables)} potential tables.")
+        end_time = time.time()
+        print(f"INFO User {g.user.id}: Found {len(discovered_tables)} potential tables in {end_time - start_time:.2f} seconds.")
         return jsonify(discovered_tables)
 
-    # --- Exception Handling ---
-    except NoCredentialsError:
-        return jsonify({"error": "AWS credentials not found or invalid."}), 401
-    except (s3_client.exceptions.NoSuchBucket if s3_client else Exception):
-        # Catch specific NoSuchBucket if s3_client was initialized
-        return jsonify({"error": f"S3 bucket not found or access denied: {bucket_name}"}), 404
+    # --- Exception Handling (uses temporary s3_client context) ---
+    except NoCredentialsError: # Should not happen if STS AssumeRole worked
+        print(f"ERROR User {g.user.id}: Boto3 NoCredentialsError after successful AssumeRole? Investigate.")
+        return jsonify({"error": "AWS credentials issue occurred after assuming role."}), 500
+    except (s3_client.exceptions.NoSuchBucket if s3_client else Exception) as e:
+         print(f"ERROR User {g.user.id}: S3 Bucket not found or access denied via assumed role: {bucket_name}. Error: {e}")
+         return jsonify({"error": f"S3 bucket '{bucket_name}' not found or access denied via assumed role."}), 404
     except (s3_client.exceptions.ClientError if s3_client else Exception) as e:
-        # General S3 client errors
-        error_code = e.response.get('Error', {}).get('Code', 'Unknown') if hasattr(e, 'response') else 'Unknown'
-        # Handle Access Denied specifically for the root path listing
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        print(f"ERROR User {g.user.id}: AWS ClientError listing tables via assumed role: {error_code} - {e}")
         if error_code == 'AccessDenied':
-             return jsonify({"error": f"Access denied when listing path: {s3_root_path}"}), 403
-        print(f"ERROR: AWS ClientError listing tables: {error_code} - {e}")
-        traceback.print_exc()
-        return jsonify({"error": f"AWS ClientError ({error_code}) listing tables. Check logs."}), 500
+            return jsonify({"error": f"Access Denied via assumed role when listing path: {s3_root_path}. Check Role permissions."}), 403
+        return jsonify({"error": f"AWS ClientError ({error_code}) listing tables via assumed role. Check Role permissions or path."}), 500
     except ValueError as e: # Catch invalid S3 path format
-        print(f"ERROR: ValueError listing tables: {e}")
-        return jsonify({"error": f"Invalid input path: {str(e)}"}), 400
+         print(f"ERROR User {g.user.id}: ValueError listing tables: {e}")
+         return jsonify({"error": f"Invalid input path: {str(e)}"}), 400
     except Exception as e:
-        print(f"ERROR: An unexpected error occurred while listing tables: {e}")
-        traceback.print_exc()
-        return jsonify({"error": f"An unexpected server error occurred: {str(e)}"}), 500
+         print(f"ERROR User {g.user.id}: An unexpected error occurred while listing tables: {e}")
+         traceback.print_exc()
+         return jsonify({"error": f"An unexpected server error occurred: {str(e)}"}), 500
 
 @app.route('/recent_usage', methods=['GET'])
 @login_required
@@ -2059,10 +2166,21 @@ if __name__ == '__main__':
             print("Please ensure the database exists and connection details are correct in DATABASE_URL.")
             # Consider exiting if DB is essential: import sys; sys.exit(1)
 
-    if not app.config['SECRET_KEY'] or app.config['SECRET_KEY'] == 'default-insecure-key':
-       print("\nWARNING: Flask SECRET_KEY is not set or is insecure. Set FLASK_SECRET_KEY environment variable for production!\n")
+    print("\n--- Configuration Checks ---")
+    if not app.config['SECRET_KEY'] or len(app.config['SECRET_KEY']) < 16 :
+       print("WARNING: Flask SECRET_KEY is missing, short, or insecure. Set FLASK_SECRET_KEY env var.")
     if not os.getenv("ENCRYPTION_KEY"):
-        print("\nWARNING: ENCRYPTION_KEY is not set. S3 URL encryption will fail.\n")
+        print("WARNING: ENCRYPTION_KEY is not set. S3 URL encryption will fail.")
+    if not os.getenv("AWS_ACCESS_KEY_ID") or not os.getenv("AWS_SECRET_ACCESS_KEY"):
+         print("CRITICAL WARNING: AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY env vars not found.")
+         print("                 STS AssumeRole calls WILL likely fail. Configure these in Render Env.")
+    else:
+         print("INFO: AWS Credentials found in environment (used for STS).")
+    if not os.getenv("AWS_REGION"):
+         print(f"WARNING: AWS_REGION env var not found. Defaulting to '{AWS_REGION}'.")
+    else:
+         print(f"INFO: AWS Region set to '{AWS_REGION}'.")
+    print("--------------------------\n")
 
     print("Starting Flask server...")
     app.run(debug=True, host='0.0.0.0', port=5000) # Use debug=False and Gunicorn/uWSGI for production
