@@ -15,13 +15,15 @@ from flask_cors import CORS
 import re
 import time
 from botocore.exceptions import NoCredentialsError
+import google.generativeai as genai
 from flask_sqlalchemy import SQLAlchemy
 import bcrypt
 import functools
 from cryptography.fernet import Fernet, InvalidToken
-
 load_dotenv()
-
+API_KEY = os.getenv("GEMINI_API_KEY")
+# Configure Gemini API
+genai.configure(api_key=API_KEY)
 app = Flask(__name__)
 
 CORS(app)
@@ -340,6 +342,10 @@ def add_s3_usage_log(user_id, s3_link):
         traceback.print_exc()
 
 # --- Helper Functions ---
+def get_gemini_response(prompt):
+    model = genai.GenerativeModel("gemini-2.0-flash-lite")  # Use "gemini-pro" for text-based tasks
+    response = model.generate_content(prompt)
+    return response.text
 
 def format_bytes(size_bytes):
     """Converts bytes to a human-readable string (KB, MB, GB)."""
@@ -1990,6 +1996,12 @@ def compare_delta_schema_endpoint():
                 print(f"ERROR: Failed to cleanup temporary directory {temp_dir_obj.name}: {cleanup_err}")
 
 
+from urllib.parse import urlparse, unquote
+import boto3
+from botocore.exceptions import NoCredentialsError # Make sure this import is present
+# ... other imports ...
+
+# --- NEW Endpoint to List Tables ---
 @app.route('/list_tables', methods=['GET'])
 @login_required
 def list_tables():
@@ -2125,6 +2137,36 @@ def list_tables():
          traceback.print_exc()
          return jsonify({"error": f"An unexpected server error occurred: {str(e)}"}), 500
 
+@app.route("/generate-summary", methods=["POST"])
+def generate():
+    data = request.get_json()
+    comparison_details_str = data.get("comparison", "") # Expecting a formatted string
+    v1_label = data.get("v1_label", "Older Version") # Optional: Get version labels for context
+    v2_label = data.get("v2_label", "Newer Version") # Optional
+
+    if not comparison_details_str:
+        return jsonify({"error": "Missing 'comparison' field in request body."}), 400
+
+    # Refined prompt for summarizing statistical changes
+    prompt = (
+    f"Summarize the key statistical changes between two table snapshots: '{v1_label}' and '{v2_label}', based on the details below.\n\n"
+    "Focus on significant increases or decreases in records, files, size, and deletes mentioned in the details. "
+    "Keep the summary concise (1 sentence, maximum 2). "
+    "The final output must be *only* the HTML paragraph itself, starting with `<p>` and ending with `</p>`. "
+    "Use `<strong></strong>` tags for the keywords.\n\n"
+    "Change Details:\n"
+    f"{comparison_details_str}"
+    )
+
+    try:
+        # Assuming get_gemini_response handles the API call to Gemini
+        summary = get_gemini_response(prompt)
+        return jsonify({"summary": summary}) # Return summary under 'summary' key
+    except Exception as e:
+        print(f"Error generating summary: {e}") # Log the error server-side
+        traceback.print_exc() # Print full traceback for debugging
+        return jsonify({"error": f"Failed to generate summary: {str(e)}"}), 500
+    
 @app.route('/recent_usage', methods=['GET'])
 @login_required
 def recent_usage():
@@ -2154,6 +2196,14 @@ def recent_usage():
 def root():
      # Public endpoint, no login required
      return jsonify(status="API is running", timestamp=datetime.datetime.utcnow().isoformat() + 'Z')
+
+@app.route('/', methods=['GET'])
+def hello():
+    return """
+    Hello! Available endpoints:
+     - /Iceberg?s3_url=&lt;s3://your-bucket/path/to/iceberg-table/&gt;
+     - /Delta?s3_url=&lt;s3://your-bucket/path/to/delta-table/&gt;
+    """
 
 if __name__ == '__main__':
     with app.app_context():
